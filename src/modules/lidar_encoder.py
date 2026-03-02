@@ -81,7 +81,7 @@ class HandcraftedLidarBEV:
         """
         bev = np.zeros((self.NUM_CHANNELS, self.ny, self.nx), dtype=np.float32)
 
-        # ── 1. Range filter ───────────────────────────────────────────────
+        # Range filter
         mask = (
             (points[:, 0] >= self.x_min) & (points[:, 0] < self.x_max) &
             (points[:, 1] >= self.y_min) & (points[:, 1] < self.y_max)
@@ -91,7 +91,7 @@ class HandcraftedLidarBEV:
         if len(pts) == 0:
             return torch.from_numpy(bev).unsqueeze(0).to(device)
 
-        # ── 2. Compute cell indices ───────────────────────────────────────
+        # Compute cell indices
         xi = np.clip(
             np.floor((pts[:, 0] - self.x_min) / self.x_res).astype(np.int32),
             0, self.nx - 1,
@@ -104,23 +104,22 @@ class HandcraftedLidarBEV:
         z         = pts[:, 2]
         intensity = pts[:, 3]
 
-        # ── Ch 0: Occupancy ───────────────────────────────────────────────
+        # Occupancy 
         bev[0, yi, xi] = 1.0
 
-        # ── Ch 1: Max height (normalised) ─────────────────────────────────
-        # Use np.maximum.at for per-cell max (scatter reduce)
-        z_min, z_max = -3.0, 5.0   # nuScenes typical ego-frame z range
+        # Max height (normalised)
+        z_min, z_max = -3.0, 5.0   # ego-frame z range
         z_norm = np.clip((z - z_min) / (z_max - z_min), 0.0, 1.0)
         np.maximum.at(bev[1], (yi, xi), z_norm)
 
-        # ── Ch 2: Point density (normalised) ─────────────────────────────
+        # Point density
         count_map = np.zeros((self.ny, self.nx), dtype=np.float32)
         np.add.at(count_map, (yi, xi), 1.0)
         max_count = count_map.max()
         if max_count > 0:
             bev[2] = count_map / max_count
 
-        # ── Ch 3: Mean intensity ──────────────────────────────────────────
+        # Mean intensity 
         intensity_sum = np.zeros((self.ny, self.nx), dtype=np.float32)
         np.add.at(intensity_sum, (yi, xi), intensity)
         # Divide sum by count (avoid div-by-zero on empty cells)
@@ -168,7 +167,6 @@ class PointPillarsEncoder(nn.Module):
         self.pillar_channels = pillar_channels
         self.out_channels = out_channels
 
-        # ── PointNet MLP ─────────────────────────────────────────────────
         self.pointnet = nn.Sequential(
             nn.Linear(self.POINT_DIM, 32, bias=False),
             nn.BatchNorm1d(32),
@@ -178,7 +176,7 @@ class PointPillarsEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # ── BEV backbone ─────────────────────────────────────────────────
+        # BEV backbone 
         def _block(in_ch, out_ch):
             return nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
@@ -193,8 +191,7 @@ class PointPillarsEncoder(nn.Module):
             _block(pillar_channels, pillar_channels * 2),
             _block(pillar_channels * 2, out_channels),
         )
-
-    # ── Internal helpers ──────────────────────────────────────────────────
+        
 
     def _pillarise(self, points: np.ndarray):
         """
@@ -282,7 +279,6 @@ class PointPillarsEncoder(nn.Module):
             bev[0, :, yi, xi] = descriptors.T   # (C, P) broadcast
         return bev
 
-    # ── Public forward ────────────────────────────────────────────────────
 
     def forward(self, points: np.ndarray, device: torch.device) -> torch.Tensor:
         """
