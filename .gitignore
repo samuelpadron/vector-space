@@ -1,4 +1,5 @@
-data
+data/nuscenes
 lib
 CACHEDIR.TAG
 pyvenv.cfg
+__pycache__

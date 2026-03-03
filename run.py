@@ -36,7 +36,7 @@ from src.hypothesis_test import (
 NUSCENES_ROOT   = Path('./data/nuscenes')
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 OUTPUT_DIR      = Path('./viz_output')
-NUM_SAMPLES     = 3
+NUM_SAMPLES     = 10
 OPT_STEPS       = 500
 OPT_LR          = 1e-2
 LIDAR_CHANNELS  = 4
@@ -137,8 +137,10 @@ def main():
             optimizer.zero_grad()
             delta      = displacement_head(cam_bev, lidar_bev)   # [1, 2, H, W]
             warped_cam = apply_dense_warp(cam_bev, delta)        # [1, 256, H, W]
-            cam_proj   = lidar_projector(warped_cam)             # [1, 64, H, W]
-            loss = F.mse_loss(cam_proj, lidar_bev.detach())
+            lidar_occupancy = lidar_bev[:, 0:1, :, :]          # channel 0 = occupancy
+            valid_mask = (lidar_occupancy > 0).float()          # 1 where LiDAR has returns
+            cam_proj = lidar_projector(warped_cam)
+            loss = F.mse_loss(cam_proj * valid_mask, lidar_bev.detach() * valid_mask)
             loss.backward()
             optimizer.step()
 

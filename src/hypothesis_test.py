@@ -6,7 +6,7 @@ Tests whether the dense displacement field learned by DisplacementHead
 Sim(2) / SE(2) transform (H1: rigid Lie-group alignment).
 
 H1_geo : The dense field is approximately explainable by Sim(2) with
-         small residual  →  high R², small geodesic distance.
+         small residual  →  high R²
 H0_geo : The residual after Sim(2) fitting remains large and structured
          →  low R², large spatially-structured residual heatmap.
 
@@ -61,11 +61,10 @@ def run_geometric_test(
     """
     device = delta.device
 
-    # 1. Source grid in normalised [-1, 1] coordinates
     grid = create_meshgrid(H, W, normalized_coordinates=True, device=device)
     src_pts = grid.reshape(-1, 2).double()   # (H*W, 2)
 
-    # 2. Target points = source + displacement (delta already normalised)
+    # Target points = source + displacement (delta already normalised)
     norm_delta = torch.stack([
         delta[0, 0],   # x offsets
         delta[0, 1],   # y offsets
@@ -73,7 +72,7 @@ def run_geometric_test(
 
     dst_pts = src_pts + norm_delta   # (H*W, 2)
 
-    # 3. Build Sim(2) linear system  A·[a, b, tx, ty]ᵀ = dst
+    # Build Sim(2) linear system  A·[a, b, tx, ty]ᵀ = dst
     #    Row 2i  : [ x, -y, 1, 0 ]
     #    Row 2i+1: [ y,  x, 0, 1 ]
     x, y = src_pts[:, 0], src_pts[:, 1]
@@ -87,7 +86,7 @@ def run_geometric_test(
     sol = torch.linalg.lstsq(A, B_vec).solution.squeeze()
     a, b, tx, ty = sol
 
-    # 4. Extract Sim(2) primitives via Kornia SO(2)
+    # Extract Sim(2) primitives via Kornia SO(2)
     scale = torch.sqrt(a ** 2 + b ** 2)
 
     rot_mat = torch.stack([
@@ -98,12 +97,12 @@ def run_geometric_test(
     so2_element = KLieGroup.So2.from_matrix(rot_mat)
     theta_rad = so2_element.log().squeeze()   # scalar tensor
 
-    # 5. Geodesic distance on SE(2) manifold
+    # Geodesic distance on SE(2) manifold
     t_vec = torch.tensor([[tx, ty]], device=device, dtype=torch.float64)
     se2_element = KLieGroup.Se2(so2_element, t_vec)
     geodesic_dist = torch.norm(se2_element.log()).item()
 
-    # 6. Residuals and R²
+    # Residuals and R²
     fitted_pts = (A @ sol).reshape(-1, 2)
     residuals = dst_pts - fitted_pts   # (H*W, 2) — non-rigid remainder
 
@@ -225,3 +224,6 @@ def visualize_residual_heatmap(
         plt.savefig(save_path, bbox_inches='tight')
         print(f"  Saved residual heatmap → {save_path}")
     plt.close()
+
+def visualize_bev_alignment():
+    pass

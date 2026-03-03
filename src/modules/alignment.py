@@ -32,6 +32,8 @@ class DisplacementHead(nn.Module):
     def __init__(self, camera_channels: int = 256, lidar_channels: int = 64):
         super().__init__()
         mid_channels = 128
+        
+        self.MAX_OFFSET = 0.1
         self.net = nn.Sequential(
             nn.Conv2d(camera_channels + lidar_channels, mid_channels, kernel_size=1),
             nn.BatchNorm2d(mid_channels),
@@ -51,7 +53,7 @@ class DisplacementHead(nn.Module):
         -------
         delta : [B, 2, H, W]  normalised displacement field in [-1, 1]
         """
-        return self.net(torch.cat([cam_bev, lidar_bev], dim=1))
+        return self.net(torch.cat([cam_bev, lidar_bev], dim=1)) * self.MAX_OFFSET
 
 
 class LidarProjector(nn.Module):
