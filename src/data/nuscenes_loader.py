@@ -182,3 +182,82 @@ def load_checkpoint(model, checkpoint_path, device='cuda'):
             print(f"    - {k}")
 
     return model
+
+
+# nuScenes category → detection class name + index
+_CAT_TO_CLS = {
+    'vehicle.car':                  ('car',                   0),
+    'vehicle.truck':                ('truck',                 1),
+    'vehicle.construction':         ('construction_vehicle',  2),
+    'vehicle.bus.rigid':            ('bus',                   3),
+    'vehicle.bus.bendy':            ('bus',                   3),
+    'vehicle.trailer':              ('trailer',               4),
+    'movable_object.barrier':       ('barrier',               5),
+    'vehicle.motorcycle':           ('motorcycle',            6),
+    'vehicle.bicycle':              ('bicycle',               7),
+    'human.pedestrian.adult':       ('pedestrian',            8),
+    'human.pedestrian.child':       ('pedestrian',            8),
+    'human.pedestrian.wheelchair':  ('pedestrian',            8),
+    'human.pedestrian.stroller':    ('pedestrian',            8),
+    'movable_object.trafficcone':   ('traffic_cone',          9),
+}
+
+
+def load_gt_boxes(nusc, sample_token: str) -> list:
+    """
+    Load ground truth bounding boxes for a nuScenes sample in ego frame.
+
+    Transforms each annotation from global frame → ego frame so the boxes
+    sit in the same coordinate system as the BEV grid (ego-centred, x=forward,
+    y=left, 0.8m/pixel over ±51.2m).
+
+    Returns
+    -------
+    List of dicts with keys: x, y, z, w, l, h, yaw, class, name
+    Only returns categories that map to one of the 10 detection classes.
+    """
+    from pyquaternion import Quaternion as _Quaternion
+    import numpy as _np
+
+    sample   = nusc.get('sample', sample_token)
+    lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    ego_pose = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+
+    # Ego pose in global frame
+    t_ego = _np.array(ego_pose['translation'])
+    R_ego = _Quaternion(ego_pose['rotation'])
+
+    gt_boxes = []
+    for ann_token in sample['anns']:
+        ann      = nusc.get('sample_annotation', ann_token)
+        cat_name = ann['category_name']
+
+        if cat_name not in _CAT_TO_CLS:
+            continue
+
+        cls_name, cls_idx = _CAT_TO_CLS[cat_name]
+
+        # Global position → ego frame
+        xyz_global = _np.array(ann['translation'])
+        xyz_ego    = R_ego.inverse.rotate(xyz_global - t_ego)
+
+        # Global yaw → ego frame yaw
+        ann_q   = _Quaternion(ann['rotation'])
+        ego_q   = R_ego.inverse * ann_q
+        yaw_ego = ego_q.yaw_pitch_roll[0]   # yaw around z-axis
+
+        w, l, h = ann['size']   # nuScenes: [width, length, height]
+
+        gt_boxes.append({
+            'x':     float(xyz_ego[0]),   # forward
+            'y':     float(xyz_ego[1]),   # left
+            'z':     float(xyz_ego[2]),
+            'w':     float(w),
+            'l':     float(l),
+            'h':     float(h),
+            'yaw':   float(yaw_ego),
+            'class': cls_idx,
+            'name':  cls_name,
+        })
+
+    return gt_boxes

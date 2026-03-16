@@ -3,3 +3,7 @@ lib
 CACHEDIR.TAG
 pyvenv.cfg
 __pycache__
+validation_output 
+viz_output
+eval_output
+models 
