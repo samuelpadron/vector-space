@@ -7,3 +7,4 @@ validation_output
 viz_output
 eval_output
 models 
+.env
