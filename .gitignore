@@ -7,4 +7,5 @@ validation_output
 viz_output
 eval_output
 models 
+download_nuscenes.py
 .env
