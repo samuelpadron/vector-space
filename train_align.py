@@ -52,15 +52,16 @@ FASTBEV_CKPT    = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 PP_CKPT         = Path('./models/pointpillars/hv_pointpillars_fpn_sbn-all_fp16_2x8_2x_nus-3d_20201021_120719-269f9dd6.pth')
 CKPT_DIR        = Path('./checkpoints')
 
-NUSCENES_VER    = 'v1.0-mini'
+NUSCENES_VER    = 'v1.0-trainval'
 BEV_EXTENT      = 51.2       # metres, half-width of BEV grid
 CANVAS_SIZE     = (128, 128) # must match cam_bev spatial dims
 
 # Training
-EPOCHS          = 30
+EPOCHS          = 10
 LR              = 3e-4
 WEIGHT_DECAY    = 1e-4
-LOG_EVERY       = 5          # print every N samples
+LOG_EVERY       = 50          # print every N samples
+VAL_EVERY       = 5          # run validation every N epochs
 
 # Model
 CAM_CHANNELS    = 256
@@ -153,8 +154,10 @@ def main():
     nusc_maps = load_nusc_maps(str(NUSCENES_ROOT))
 
     # Use all mini samples for training
-    train_tokens = get_sample_tokens(nusc, split='mini_train')
+    train_tokens = get_sample_tokens(nusc, split='train')
+    val_tokens   = get_sample_tokens(nusc, split='val')
     print(f"  Training samples: {len(train_tokens)}")
+    print(f"  Validation samples: {len(val_tokens)}")
 
     print("\nComputing class weights...")
     all_labels = [
@@ -238,26 +241,78 @@ def main():
               + "  ".join(f"{CLASS_NAMES[c]}={mean_iou[c]:.4f}"
                           for c in range(NUM_CLASSES)))
 
+        val_loss     = None
+        val_miou     = None
+
+        if epoch % VAL_EVERY == 0 or epoch == EPOCHS:
+            print(f"  Running validation ({len(val_tokens)} samples)...")
+            model.eval()
+            v_loss = 0.0
+            v_iou  = torch.zeros(NUM_CLASSES)
+            n_val  = 0
+ 
+            with torch.no_grad():
+                for val_token in val_tokens:
+                    images, intrinsics, cam2egos, img_aug_matrices, _ = load_sample(
+                        nusc, val_token
+                    )
+                    images           = images.unsqueeze(0).to(device)
+                    intrinsics       = intrinsics.unsqueeze(0).to(device)
+                    cam2egos         = cam2egos.unsqueeze(0).to(device)
+                    img_aug_matrices = img_aug_matrices.unsqueeze(0).to(device)
+ 
+                    cam_bev   = fastbev(images, cam2egos, intrinsics,
+                                        img_aug_matrices)['bev_feat']
+                    raw_pts   = load_lidar_points(nusc, val_token)
+                    lidar_bev = pointpillars(raw_pts, device)
+ 
+                    labels = get_bev_map_labels(
+                        nusc, nusc_maps, val_token,
+                        bev_extent=BEV_EXTENT,
+                        canvas_size=CANVAS_SIZE,
+                        device=device,
+                    ).unsqueeze(0)
+ 
+                    logits, _ = model(cam_bev, lidar_bev)
+                    loss      = seg_loss(logits, labels, pos_weight=pos_weight)
+                    v_loss   += loss.item()
+                    v_iou    += compute_iou(logits, labels)
+                    n_val    += 1
+ 
+            val_loss = v_loss / n_val
+            val_miou = (v_iou / n_val).mean().item()
+            val_iou  = v_iou / n_val
+ 
+            print(f"  Val   loss={val_loss:.4f}  mIoU={val_miou:.4f}")
+            print(f"  Val IoU: "
+                  + "  ".join(f"{CLASS_NAMES[c]}={val_iou[c]:.4f}"
+                               for c in range(NUM_CLASSES)))
+
         ckpt = {
             'epoch':       epoch,
             'model':       model.state_dict(),
             'optimizer':   optimizer.state_dict(),
             'scheduler':   scheduler.state_dict(),
-            'loss':        mean_loss,
-            'miou':        mean_iou_val,
+            'train_loss':        mean_loss,
+            'train_miou':        mean_iou_val,
+            'val_loss':          val_loss,
+            'val_miou':          val_miou,
         }
         torch.save(ckpt, ckpt_last)
 
-        if mean_loss < best_loss:
+        monitor = val_loss if val_loss is not None else mean_loss
+        if monitor < best_loss:
             best_loss = mean_loss
             torch.save(ckpt, ckpt_best)
-            print(f"  ✓ New best checkpoint (loss={best_loss:.4f})")
+            print(f"  ✓ New best checkpoint (monitor={best_loss:.4f})")
 
         history.append({
             'epoch':    epoch,
-            'loss':     mean_loss,
-            'miou':     mean_iou_val,
-            'iou':      mean_iou.tolist(),
+            'train_loss':     mean_loss,
+            'train_miou':     mean_iou_val,
+            'train_iou':      mean_iou.tolist(),
+            'val_loss':       val_loss,
+            'val_miou':       val_miou,
             'lr':       scheduler.get_last_lr()[0],
         })
 
