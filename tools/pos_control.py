@@ -46,7 +46,6 @@ from hypothesis_test import run_geometric_test
 from seg_align import BEVAlignSegNet
 from nuscenes.nuscenes import NuScenes
 
-# ── Configuration ──────────────────────────────────────────────────────────────
 
 NUSCENES_ROOT   = Path('./data/nuscenes')
 FASTBEV_CKPT    = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
@@ -57,7 +56,6 @@ OUTPUT_DIR      = Path('./validation_output')
 NUM_SAMPLES     = 8
 CANVAS_SIZE     = (128, 128)
 
-# Primary transform (supervisor's specification)
 PRIMARY_TRANSFORM = {
     'theta_deg': 5.0,
     'tx_pixels': 3.0,
@@ -88,8 +86,6 @@ SWEEP_CASES = [
 
 NOISE_STD = 0.5   # pixels std for mixed condition
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def apply_known_sim2(
     tensor: torch.Tensor,
@@ -136,14 +132,11 @@ def norm_to_pixels(n: float, dim: int) -> float:
     return n * (dim / 2)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    # ── Load frozen encoders ───────────────────────────────────────────────
     print("\nLoading FastBEV (frozen)...")
     fastbev = FastBEV(
         in_channels=256, bev_channels=64, out_channels=256,
@@ -158,7 +151,7 @@ def main():
         out_spatial_size=CANVAS_SIZE,
     ).to(device).eval()
 
-    # ── Load trained BEVAlignSegNet ────────────────────────────────────────
+    # Load trained BEVAlignSegNet
     print("Loading trained BEVAlignSegNet...")
     model = BEVAlignSegNet().to(device)
     ckpt  = torch.load(ALIGN_CKPT, map_location=device)
@@ -168,7 +161,7 @@ def main():
           f"train_loss={ckpt['train_loss']:.4f}  "
           f"val_loss={ckpt.get('val_loss', 'N/A')}")
 
-    # ── Load nuScenes and extract BEV pairs ───────────────────────────────
+    # Load nuScenes and extract BEV pairs
     print("\nLoading nuScenes...")
     nusc = NuScenes(version='v1.0-mini', dataroot=str(NUSCENES_ROOT), verbose=False)
 
@@ -200,7 +193,7 @@ def main():
     H = cam_bevs[0].shape[2]
     W = cam_bevs[0].shape[3]
 
-    # ── Primary positive control ───────────────────────────────────────────
+    # Primary positive control
     print("\n" + "=" * 70)
     print("  PRIMARY POSITIVE CONTROL")
     print(f"  Transform: {PRIMARY_TRANSFORM['theta_deg']}° rotation, "
@@ -287,7 +280,7 @@ def main():
             json.dump(out, f, indent=2)
         return
 
-    # ── Sweep over transform magnitudes ───────────────────────────────────
+    # Sweep tests
     print("\n" + "=" * 70)
     print("  SWEEP — operating range characterisation (sample 0 only)")
     print("=" * 70)
@@ -323,7 +316,7 @@ def main():
             'errors': {'theta_deg': theta_err, 'tx_pixels': tx_err},
         })
 
-    # ── Mixed condition (rigid + noise) ────────────────────────────────────
+    # Mixed condition (rigid + noise)
     print("\n" + "=" * 70)
     print(f"  MIXED CONDITION — rigid transform + noise (std={NOISE_STD}px)")
     print("=" * 70)
@@ -346,7 +339,7 @@ def main():
         print(f"  Sample {i}:  R²={r2:.4f}  theta={params['theta_deg']:.2f}°  tx={tx_rec_px:.2f}px")
         mixed_results.append({'sample_idx': i, 'r2': r2, 'recovered': params})
 
-    # ── Contrast: real camera-LiDAR pair (no transform) ───────────────────
+    # Contrast: real camera-LiDAR pair (no transform)
     print("\n" + "=" * 70)
     print("  CONTRAST — real camera-LiDAR pair (no synthetic transform)")
     print("=" * 70)
@@ -358,7 +351,7 @@ def main():
         print(f"  Sample {i}:  R²={r2:.4f}  theta={params['theta_deg']:.2f}°  tx={tx_rec_px:.2f}px")
         real_results.append({'sample_idx': i, 'r2': r2, 'recovered': params})
 
-    # ── Summary ────────────────────────────────────────────────────────────
+    # Summary
     mean_r2_primary = np.mean([r['r2'] for r in primary_results])
     mean_r2_mixed   = np.mean([r['r2'] for r in mixed_results])
     mean_r2_real    = np.mean([r['r2'] for r in real_results])
