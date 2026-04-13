@@ -78,3 +78,8 @@ for ax, x, centres, means, sems, xlabel, color, r_val, p_val in configs:
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_title(f'r={r_val:.3f}  p={p_val:.3f}')
     ax.legend(fontsize=9)
+
+# plt.tight_layout()
+# plt.savefig('temporal_analysis/ncc_filtered_binned.png', dpi=150, bbox_inches='tight')
+# print("\nPlot saved to temporal_analysis/ncc_filtered_binned.png")
+# plt.show()
