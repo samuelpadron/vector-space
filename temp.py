@@ -19,8 +19,16 @@ nccs      = np.array([r['ncc']      for r in filtered])
 r_speed,    p_speed    = stats.pearsonr(speeds,    nccs)
 r_yaw,      p_yaw      = stats.pearsonr(yaw_rates, nccs)
 
+# Spearman rank correlation
+
+r_speed_sp, p_speed_sp = stats.spearmanr(speeds, nccs)
+r_yaw_sp, p_yaw_sp = stats.spearmanr(yaw_rates, nccs)
+
 print(f"\nSpeed    vs NCC:    r={r_speed:.4f}  p={p_speed:.4f}")
 print(f"Yaw rate vs NCC:    r={r_yaw:.4f}  p={p_yaw:.4f}")
+
+print(f"Spearman speed    vs NCC: r={r_speed_sp:.4f}  p={p_speed_sp:.4f}")
+print(f"Spearman yaw rate vs NCC: r={r_yaw_sp:.4f}  p={p_yaw_sp:.4f}")
 
 # Binned means
 
@@ -70,8 +78,3 @@ for ax, x, centres, means, sems, xlabel, color, r_val, p_val in configs:
     ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
     ax.set_title(f'r={r_val:.3f}  p={p_val:.3f}')
     ax.legend(fontsize=9)
-
-plt.tight_layout()
-plt.savefig('temporal_analysis/ncc_filtered_binned.png', dpi=150, bbox_inches='tight')
-print("\nPlot saved to temporal_analysis/ncc_filtered_binned.png")
-plt.show()
