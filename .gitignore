@@ -1,4 +1,9 @@
 data/nuscenes
+scripts/download_nuscenes.py
+scripts/cluster
+models 
+checkpoints
+logs
 lib
 CACHEDIR.TAG
 pyvenv.cfg
@@ -6,7 +11,4 @@ __pycache__
 validation_output 
 viz_output
 eval_output
-models 
-scripts/download_nuscenes.py
-scripts/cluster
 .env
