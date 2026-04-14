@@ -8,4 +8,5 @@ viz_output
 eval_output
 models 
 scripts/download_nuscenes.py
+scripts/cluster
 .env
