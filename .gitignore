@@ -4,6 +4,7 @@ scripts/cluster
 models 
 checkpoints
 logs
+experiments
 lib
 CACHEDIR.TAG
 pyvenv.cfg
@@ -12,3 +13,4 @@ validation_output
 viz_output
 eval_output
 .env
+venv
