@@ -168,16 +168,16 @@ class FastrayTransformer(nn.Module):
 
         for b in range(B):
             # Get camera parameters
-            K = cam_intrinsics
+            K = cam_intrinsics[b]  # Extract (3, 3) from (B, 3, 3)
 
             # Transform voxels to camera frame
-            e2c = torch.inverse(cam2ego)
+            e2c = torch.inverse(cam2ego[b])  # Extract (3, 3) from (B, 3, 3)
 
             # Homogeneous voxel coords
             voxel_homo = torch.cat([voxel_coords, torch.ones(num_voxels, 1, device=device)], dim=1)
 
             # Transform to camera frame
-            cam_coords = (e2c @ voxel_homo.T).T[:, :3]  # (num_voxels, 3)
+            cam_coords = (e2c @ voxel_homo.mT).mT[:, :3]  # (num_voxels, 3)
 
             # Get depth values
             z = cam_coords[:, 2]
@@ -720,32 +720,50 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
 
     # Create figure with cameras on top, BEV on bottom
     if input_images is not None:
-        fig = plt.figure(figsize=(18, 12))
-        # Top row: 6 cameras (or fewer)
-        # Bottom row: BEV features, heatmap, detections
-        gs = fig.add_gridspec(2, 6, height_ratios=[1, 1.5], hspace=0.25, wspace=0.1)
-
-        # Camera images on top row
-        cam_names = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                     'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+        # Handle both batched (B, C, H, W) and single image (C, H, W)
+        if input_images.ndim == 4:
+            # Batched: (B, C, H, W)
+            num_cams = input_images.shape[0]
+            fig = plt.figure(figsize=(18, 12))
+            gs = fig.add_gridspec(2, 6, height_ratios=[1, 1.5], hspace=0.25, wspace=0.1)
+            cam_names = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                         'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+        else:
+            # Single image: (C, H, W) - mono camera
+            num_cams = 1
+            fig = plt.figure(figsize=(15, 10))
+            gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.5], hspace=0.25, wspace=0.15)
+            cam_names = ['CAM_FRONT']
+        
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-        for i in range(min(6, input_images.shape[0])):
+        for i in range(num_cams):
             ax_cam = fig.add_subplot(gs[0, i])
-            img = input_images[i].cpu() * std + mean
+            if input_images.ndim == 4:
+                img = input_images[i].cpu() * std + mean
+            else:
+                img = input_images.cpu() * std + mean
             img = img.permute(1, 2, 0).numpy()
             img = np.clip(img, 0, 1)
             ax_cam.imshow(img)
             ax_cam.set_title(cam_names[i], fontsize=9)
             ax_cam.axis('off')
 
-        # BEV plots on bottom row (spanning 2 columns each)
-        axes = [
-            fig.add_subplot(gs[1, 0:2]),
-            fig.add_subplot(gs[1, 2:4]),
-            fig.add_subplot(gs[1, 4:6]),
-        ]
+        # BEV plots on bottom row
+        if num_cams == 1:
+            # For mono camera, create 3 equal-width plots
+            axes = [
+                fig.add_subplot(gs[1, 0]),
+                fig.add_subplot(gs[1, 1]),
+                fig.add_subplot(gs[1, 2]),
+            ]
+        else:
+            axes = [
+                fig.add_subplot(gs[1, 0:2]),
+                fig.add_subplot(gs[1, 2:4]),
+                fig.add_subplot(gs[1, 4:6]),
+            ]
     else:
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
@@ -888,23 +906,35 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
 
 
 def visualize_cameras(images, save_path=None):
-    """Visualize camera images."""
+    """Visualize camera images. Supports both multi-camera (B, C, H, W) and mono (C, H, W)."""
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    axes = axes.flatten()
 
     cam_names = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                  'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
 
-    for i in range(6):
-        img = images[i] * std + mean
+    # Handle mono vs multi-camera
+    if images.ndim == 3:
+        # Mono camera: (C, H, W)
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        img = images * std + mean
         img = img.permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
-        axes[i].imshow(img)
-        axes[i].set_title(cam_names[i])
-        axes[i].axis('off')
+        ax.imshow(img)
+        ax.set_title('CAM_FRONT')
+        ax.axis('off')
+    else:
+        # Multi-camera: (B, C, H, W)
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        axes = axes.flatten()
+        
+        for i in range(min(6, images.shape[0])):
+            img = images[i] * std + mean
+            img = img.permute(1, 2, 0).numpy()
+            img = np.clip(img, 0, 1)
+            axes[i].imshow(img)
+            axes[i].set_title(cam_names[i])
+            axes[i].axis('off')
 
     plt.tight_layout()
 
@@ -983,7 +1013,7 @@ def main():
             outputs['bev_feat'],
             outputs['predictions'],
             save_path=output_dir / f'detections_{sample_idx}.png',
-            input_images=images[0]  # Pass the camera images
+            input_images=images[0]  # Pass single image (C, H, W) for mono camera
         )
 
     print(f"\nDone! Outputs saved to {output_dir}")
