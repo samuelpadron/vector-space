@@ -12,6 +12,8 @@ from pathlib import Path
 import sys
 from typing import Tuple, List, Dict
 
+from transformers import pipeline # For DepthAnythingV2
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
@@ -76,6 +78,7 @@ class FastrayTransformer(nn.Module):
         self.feature_size = feature_size
         self.stride = stride
 
+
         # Default grid config
         if grid_config is None:
             grid_config = {
@@ -96,8 +99,11 @@ class FastrayTransformer(nn.Module):
         self.grid_lower_bound = torch.tensor([grid_config['x'][0], grid_config['y'][0], grid_config['z'][0]])
         self.grid_interval = torch.tensor([grid_config['x'][2], grid_config['y'][2], grid_config['z'][2]])
 
-        # Depth + feature network (D + out_channels outputs)
-        self.depth_net = nn.Conv2d(in_channels, self.D + out_channels, kernel_size=1, padding=0)
+        # Feature network
+        self.feat_net = nn.Conv2d(in_channels, out_channels, 1, padding=0)
+
+        # Depth
+        self.depth_pipeline = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf")
 
         # Create voxel coordinates
         self.register_buffer('voxel_coords', self._create_voxel_coords())
@@ -112,31 +118,42 @@ class FastrayTransformer(nn.Module):
         coords = coords.reshape(-1, 3)
         return coords
 
-    def forward(self, img_feats, cam2ego, cam_intrinsics, img_aug_matrix=None):
+    def forward(self, img, img_feats, cam2ego, cam_intrinsics, img_aug_matrix=None):
         """
         Project image features to BEV.
         """
-        B, N, C, H, W = img_feats.shape
+        B, C, H, W = img_feats.shape
         device = img_feats.device
 
-        # Apply depth network
-        x = img_feats.view(B * N, C, H, W)
-        x = self.depth_net(x)
-        x = x.view(B, N, self.D + self.out_channels, H, W)
-        x = x.permute(0, 1, 3, 4, 2)  # (B, N, H, W, D+C)
+        feat = self.feat_net(img_feats)
+        feat = feat.permute(0, 2, 3, 1)  # (B, H, W, C)
 
-        # Split depth and features
-        depth = x[..., :self.D].softmax(dim=-1)  # (B, N, H, W, D)
-        feat = x[..., self.D:]  # (B, N, H, W, C)
+        # DA2 pipeline needs PIL; img is a normalized tensor (B, 3, H_img, W_img)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        img_denorm = (img * std + mean).clamp(0, 1)
+        depth_maps = []
+        for b_idx in range(B):
+            from torchvision.transforms.functional import to_pil_image
+            img_pil = to_pil_image(img_denorm[b_idx].cpu())
+            d = self.depth_pipeline(img_pil)["depth"]  # PIL grayscale at image resolution
+            d_tensor = torch.from_numpy(np.array(d)).float()
+            depth_maps.append(d_tensor)
+        # Stack and resize to feature spatial size (H, W)
+        depth = torch.stack(depth_maps).to(device)  # (B, H_img, W_img)
+        depth = F.interpolate(depth.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False).squeeze(1)
+        # Normalize to [0, 1] so it acts as a confidence weight
+        d_min = depth.flatten(1).min(1).values.view(B, 1, 1)
+        d_max = depth.flatten(1).max(1).values.view(B, 1, 1)
+        depth = (depth - d_min) / (d_max - d_min + 1e-8)  # (B, H, W)
 
-        # Project voxels to images and sample features
         bev_feat = self._project_and_sample(feat, depth, cam2ego, cam_intrinsics, img_aug_matrix)
 
         return bev_feat, depth
 
     def _project_and_sample(self, feat, depth, cam2ego, cam_intrinsics, img_aug_matrix):
         """Project voxel coordinates to images and sample features using vectorized ops."""
-        B, N, H, W, C = feat.shape
+        B, H, W, C = feat.shape
         device = feat.device
 
         # Initialize BEV feature volume
@@ -150,71 +167,68 @@ class FastrayTransformer(nn.Module):
         depth_bins = torch.arange(self.D, device=device).float() * self.grid_config['depth'][2] + self.grid_config['depth'][0]
 
         for b in range(B):
-            for n in range(N):
-                # Get camera parameters
-                c2e = cam2ego[b, n]  # (4, 4)
-                K = cam_intrinsics[b, n]  # (3, 3)
+            # Get camera parameters
+            K = cam_intrinsics
 
-                # Transform voxels to camera frame
-                e2c = torch.inverse(c2e)
+            # Transform voxels to camera frame
+            e2c = torch.inverse(cam2ego)
 
-                # Homogeneous voxel coords
-                voxel_homo = torch.cat([voxel_coords, torch.ones(num_voxels, 1, device=device)], dim=1)
+            # Homogeneous voxel coords
+            voxel_homo = torch.cat([voxel_coords, torch.ones(num_voxels, 1, device=device)], dim=1)
 
-                # Transform to camera frame
-                cam_coords = (e2c @ voxel_homo.T).T[:, :3]  # (num_voxels, 3)
+            # Transform to camera frame
+            cam_coords = (e2c @ voxel_homo.T).T[:, :3]  # (num_voxels, 3)
 
-                # Get depth values
-                z = cam_coords[:, 2]
-                valid_z = z > 0.5
+            # Get depth values
+            z = cam_coords[:, 2]
+            valid_z = z > 0.5
 
-                # Avoid division by zero
-                z_safe = torch.clamp(z, min=0.1)
+            # Avoid division by zero
+            z_safe = torch.clamp(z, min=0.1)
 
-                # Project to image plane
-                cam_coords_norm = cam_coords[:, :2] / z_safe.unsqueeze(-1)
-                cam_coords_homo = torch.cat([cam_coords_norm, torch.ones(num_voxels, 1, device=device)], dim=1)
-                img_coords = (K @ cam_coords_homo.T).T[:, :2]
+            # Project to image plane
+            cam_coords_norm = cam_coords[:, :2] / z_safe.unsqueeze(-1)
+            cam_coords_homo = torch.cat([cam_coords_norm, torch.ones(num_voxels, 1, device=device)], dim=1)
+            img_coords = (K @ cam_coords_homo.T).T[:, :2]
 
-                # Convert to feature map coordinates
-                feat_coords = img_coords / self.stride
+            # Convert to feature map coordinates
+            feat_coords = img_coords / self.stride
 
-                # Check bounds
-                valid_x = (feat_coords[:, 0] >= 0) & (feat_coords[:, 0] < W)
-                valid_y = (feat_coords[:, 1] >= 0) & (feat_coords[:, 1] < H)
-                valid = valid_x & valid_y & valid_z
+            # Check bounds
+            valid_x = (feat_coords[:, 0] >= 0) & (feat_coords[:, 0] < W)
+            valid_y = (feat_coords[:, 1] >= 0) & (feat_coords[:, 1] < H)
+            valid = valid_x & valid_y & valid_z
 
-                # Get depth bin
-                depth_bin = ((z - self.grid_config['depth'][0]) / self.grid_config['depth'][2]).long()
-                valid_depth = (depth_bin >= 0) & (depth_bin < self.D)
-                valid = valid & valid_depth
+            # Get depth bin
+            depth_bin = ((z - self.grid_config['depth'][0]) / self.grid_config['depth'][2]).long()
+            valid_depth = (depth_bin >= 0) & (depth_bin < self.D)
+            valid = valid & valid_depth
 
-                # Sample for valid points
-                valid_idx = torch.where(valid)[0]
-                if len(valid_idx) == 0:
-                    continue
+            # Sample for valid points
+            valid_idx = torch.where(valid)[0]
+            if len(valid_idx) == 0:
+                continue
 
-                # Get image coordinates
-                u = feat_coords[valid_idx, 0].long().clamp(0, W-1)
-                v = feat_coords[valid_idx, 1].long().clamp(0, H-1)
-                d = depth_bin[valid_idx].clamp(0, self.D-1)
+            # Get image coordinates
+            u = feat_coords[valid_idx, 0].long().clamp(0, W-1)
+            v = feat_coords[valid_idx, 1].long().clamp(0, H-1)
 
-                # Sample features and depth weights
-                sampled_feat = feat[b, n, v, u, :]
-                sampled_depth = depth[b, n, v, u, d]
+            # Sample features and depth weights
+            sampled_feat = feat[b, v, u, :]
+            sampled_depth = depth[b, v, u]  # (num_valid,) scalar confidence from DA2
 
-                # Weight features by depth
-                weighted_feat = sampled_feat * sampled_depth.unsqueeze(-1)
+            # Weight features by depth confidence
+            weighted_feat = sampled_feat * sampled_depth.unsqueeze(-1)
 
-                # Convert voxel index to 3D coordinates
-                vx = valid_idx // (self.Y * self.Z)
-                vy = (valid_idx % (self.Y * self.Z)) // self.Z
-                vz = valid_idx % self.Z
+            # Convert voxel index to 3D coordinates
+            vx = valid_idx // (self.Y * self.Z)
+            vy = (valid_idx % (self.Y * self.Z)) // self.Z
+            vz = valid_idx % self.Z
 
-                # Accumulate using scatter_add for efficiency
-                flat_idx = vx * self.Y * self.Z + vy * self.Z + vz
-                bev_flat = bev_feat[b].view(-1, C)
-                bev_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, C), weighted_feat)
+            # Accumulate using scatter_add for efficiency
+            flat_idx = vx * self.Y * self.Z + vy * self.Z + vz
+            bev_flat = bev_feat[b].view(-1, C)
+            bev_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, C), weighted_feat)
 
         # Collapse Z dimension (sum)
         bev_feat = bev_feat.sum(dim=3)  # (B, X, Y, C)
@@ -437,13 +451,13 @@ class FastBEV(nn.Module):
         # Detection head
         self.pts_bbox_head = CenterHead(in_channels=out_channels, num_classes=num_classes)
 
-    def extract_img_feat(self, imgs):
-        """Extract image features from all cameras."""
-        B, N, C, H, W = imgs.shape
-        imgs = imgs.view(B * N, C, H, W)
+    def extract_img_feat(self, img):
+        """Extract batch dim"""
+        B = img.shape[0]
+
 
         # Backbone (ResNet50)
-        x = self.img_backbone.conv1(imgs)
+        x = self.img_backbone.conv1(img)
         x = self.img_backbone.bn1(x)
         x = self.img_backbone.relu(x)
         x = self.img_backbone.maxpool(x)
@@ -457,17 +471,17 @@ class FastBEV(nn.Module):
         feat = self.img_neck([x3, x4])
 
         _, C_out, H_out, W_out = feat.shape
-        feat = feat.view(B, N, C_out, H_out, W_out)
+        feat = feat.view(B, C_out, H_out, W_out)
 
         return feat
 
-    def forward(self, imgs, cam2ego, cam_intrinsics, img_aug_matrix=None):
+    def forward(self, img, cam2ego, cam_intrinsics, img_aug_matrix=None):
         """Forward pass."""
         # Extract image features
-        img_feats = self.extract_img_feat(imgs)
+        img_feats = self.extract_img_feat(img)
 
         # Project to BEV
-        bev_feat, depth = self.img_view_transformer(img_feats, cam2ego, cam_intrinsics, img_aug_matrix)
+        bev_feat, depth = self.img_view_transformer(img, img_feats, cam2ego, cam_intrinsics, img_aug_matrix)
 
         # Encode BEV
         bev_feats = self.img_bev_encoder_backbone(bev_feat)
@@ -567,56 +581,39 @@ def load_sample(nusc, sample_token, target_size=(256, 704)):
     """Load a nuScenes sample with all cameras."""
     sample = nusc.get('sample', sample_token)
 
-    cam_names = [
-        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-        'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'
-    ]
+    cam_name = 'CAM_FRONT'
+    cam_token = sample['data'][cam_name]
+    cam_data = nusc.get('sample_data', cam_token)
 
-    images = []
-    intrinsics = []
-    cam2egos = []
-    img_aug_matrices = []
+    # Load image
+    img_path = Path(nusc.dataroot) / cam_data['filename']
+    img = Image.open(img_path).convert('RGB')
+    orig_size = img.size  # (W, H)
 
-    for cam_name in cam_names:
-        cam_token = sample['data'][cam_name]
-        cam_data = nusc.get('sample_data', cam_token)
+    # Resize
+    img_resized = img.resize((target_size[1], target_size[0]))
+    img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
 
-        # Load image
-        img_path = Path(nusc.dataroot) / cam_data['filename']
-        img = Image.open(img_path).convert('RGB')
-        orig_size = img.size  # (W, H)
+    # Normalize
+    img_tensor = normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        # Resize
-        img_resized = img.resize((target_size[1], target_size[0]))
-        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
+    # Get calibration
+    intrinsic, cam2ego = get_sensor_transforms(nusc, cam_token)
 
-        # Normalize
-        img_tensor = normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        images.append(img_tensor)
+    # Adjust intrinsics for resize
+    scale_x = target_size[1] / orig_size[0]
+    scale_y = target_size[0] / orig_size[1]
+    intrinsic_scaled = intrinsic.copy()
+    intrinsic_scaled[0, :] *= scale_x
+    intrinsic_scaled[1, :] *= scale_y
 
-        # Get calibration
-        intrinsic, cam2ego = get_sensor_transforms(nusc, cam_token)
+    intrinsics = torch.from_numpy(intrinsic_scaled).float()
+    cam2ego = torch.from_numpy(cam2ego).float()
 
-        # Adjust intrinsics for resize
-        scale_x = target_size[1] / orig_size[0]
-        scale_y = target_size[0] / orig_size[1]
-        intrinsic_scaled = intrinsic.copy()
-        intrinsic_scaled[0, :] *= scale_x
-        intrinsic_scaled[1, :] *= scale_y
+    # Image augmentation matrix (identity for inference)
+    img_aug = torch.eye(3)
 
-        intrinsics.append(torch.from_numpy(intrinsic_scaled).float())
-        cam2egos.append(torch.from_numpy(cam2ego).float())
-
-        # Image augmentation matrix (identity for inference)
-        img_aug = torch.eye(3)
-        img_aug_matrices.append(img_aug)
-
-    images = torch.stack(images, dim=0)
-    intrinsics = torch.stack(intrinsics, dim=0)
-    cam2egos = torch.stack(cam2egos, dim=0)
-    img_aug_matrices = torch.stack(img_aug_matrices, dim=0)
-
-    return images, intrinsics, cam2egos, img_aug_matrices, sample
+    return img_tensor, intrinsics, cam2ego, img_aug, sample
 
 
 def decode_predictions(preds, score_threshold=0.3, max_objects=50):
