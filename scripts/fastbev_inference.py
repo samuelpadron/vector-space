@@ -687,7 +687,7 @@ def decode_predictions(preds, score_threshold=0.3, max_objects=50):
     return detections
 
 
-def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=None):
+def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=None, depth_maps=None):
     """Visualize BEV features with detected bounding boxes.
 
     Orientation: FRONT is UP (like driving forward up the screen)
@@ -701,6 +701,7 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
         preds: Detection predictions
         save_path: Path to save visualization
         input_images: Optional (N, 3, H, W) tensor of input camera images
+        depth_maps: Optional (N, H, W) tensor of depth maps from DepthAnythingV2
     """
     class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
@@ -710,13 +711,13 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
     detections = decode_predictions(preds, score_threshold=0.2)
     print(f"  Found {len(detections)} detections above threshold")
 
-    # BEV feature visualization - rotate 90° CCW so FRONT is UP
+    # BEV feature visualization - rotate 90° CW so FRONT is UP
     bev = bev_feat[0].mean(dim=0).detach().cpu().numpy()
-    bev = np.rot90(bev, k=1)  # Rotate 90° counter-clockwise
+    bev = np.rot90(bev, k=3)  # Rotate 90° clockwise
 
     # Heatmap - same rotation
     heatmap = preds[0]['heatmap'][0].sigmoid().max(dim=0)[0].detach().cpu().numpy()
-    heatmap = np.rot90(heatmap, k=1)
+    heatmap = np.rot90(heatmap, k=3)
 
     # Create figure with cameras on top, BEV on bottom
     if input_images is not None:
@@ -732,14 +733,18 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
             # Single image: (C, H, W) - mono camera
             num_cams = 1
             fig = plt.figure(figsize=(15, 10))
-            gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.5], hspace=0.25, wspace=0.15)
+            gs = fig.add_gridspec(2, 3, height_ratios=[1.2, 1], hspace=0.25, wspace=0.15)
             cam_names = ['CAM_FRONT']
         
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
         for i in range(num_cams):
-            ax_cam = fig.add_subplot(gs[0, i])
+            if input_images.ndim == 4:
+                ax_cam = fig.add_subplot(gs[0, i])
+            else:
+                # Single camera: left side for camera
+                ax_cam = fig.add_subplot(gs[0, 0])
             if input_images.ndim == 4:
                 img = input_images[i].cpu() * std + mean
             else:
@@ -749,6 +754,15 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
             ax_cam.imshow(img)
             ax_cam.set_title(cam_names[i], fontsize=9)
             ax_cam.axis('off')
+
+        # Add depth heatmap next to camera if available
+        if depth_maps is not None and input_images is not None:
+            if input_images.ndim == 3:  # Single camera
+                ax_depth = fig.add_subplot(gs[0, 1])
+                depth_img = depth_maps[0].cpu().numpy() if depth_maps.ndim == 3 else depth_maps.cpu().numpy()
+                ax_depth.imshow(depth_img, cmap='plasma')
+                ax_depth.set_title('DepthAnythingV2', fontsize=9)
+                ax_depth.axis('off')
 
         # BEV plots on bottom row
         if num_cams == 1:
@@ -861,7 +875,7 @@ def visualize_bev_with_detections(bev_feat, preds, save_path=None, input_images=
 
         color = class_colors[det['class']]
 
-        # Rotate yaw by 90° as well
+        # Rotate yaw by 90 well
         rotated_yaw = det['yaw'] + np.pi/2
 
         cos_yaw = np.cos(rotated_yaw)
@@ -954,6 +968,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Create depth estimation pipeline
+    print("Creating DepthAnythingV2 pipeline...")
+    depth_pipeline = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf")
+
     # Create model
     print("\nCreating FastBEV model...")
     model = FastBEV(
@@ -990,7 +1008,17 @@ def main():
         print(f"\nProcessing sample {sample_idx}: {sample_token[:8]}...")
 
         # Load data
-        images, intrinsics, cam2egos, img_aug_matrices, _ = load_sample(nusc, sample_token)
+        images, intrinsics, cam2egos, img_aug_matrices, sample_data = load_sample(nusc, sample_token)
+
+        # Compute depth map for visualization
+        cam_name = 'CAM_FRONT'
+        cam_token = sample_data['data'][cam_name]
+        cam_data = nusc.get('sample_data', cam_token)
+        img_path = Path(nusc.dataroot) / cam_data['filename']
+        img_pil = Image.open(img_path).convert('RGB')
+        depth_result = depth_pipeline(img_pil)
+        depth_map = torch.from_numpy(np.array(depth_result["depth"])).float()
+        depth_map = depth_map.unsqueeze(0)  # Add batch dimension
 
         # Add batch dimension and move to device
         images = images.unsqueeze(0).to(device)
@@ -1013,7 +1041,8 @@ def main():
             outputs['bev_feat'],
             outputs['predictions'],
             save_path=output_dir / f'detections_{sample_idx}.png',
-            input_images=images[0]  # Pass single image (C, H, W) for mono camera
+            input_images=images[0],  # Pass single image (C, H, W) for mono camera
+            depth_maps=depth_map
         )
 
     print(f"\nDone! Outputs saved to {output_dir}")
