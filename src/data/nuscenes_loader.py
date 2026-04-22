@@ -5,7 +5,8 @@ and detection decoding.
 """
 
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional, Dict
+import sys
 
 import numpy as np
 import torch
@@ -14,6 +15,10 @@ from PIL import Image
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 from torchvision.transforms.functional import normalize
+
+# Add src to path for ego_motion import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from modules.ego_motion import EgoMotionEstimator, EgoPose
 
 
 def get_sensor_transforms(nusc: NuScenes, sample_data_token: str):
@@ -32,59 +37,112 @@ def get_sensor_transforms(nusc: NuScenes, sample_data_token: str):
     return intrinsic, cam2ego
 
 
+def get_ego_pose(nusc: NuScenes, sample_token: str) -> EgoPose:
+    """
+    Extract ego pose (position and rotation) for a nuScenes sample.
+
+    Args:
+        nusc: NuScenes instance
+        sample_token: Sample token
+
+    Returns:
+        EgoPose with x, y, z, roll, pitch, yaw
+    """
+    sample = nusc.get('sample', sample_token)
+    lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    ego_pose_dict = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+
+    t = np.array(ego_pose_dict['translation'])
+    q = Quaternion(ego_pose_dict['rotation'])
+    roll, pitch, yaw = q.yaw_pitch_roll  # yaw_pitch_roll returns (yaw, pitch, roll)
+    # Reorder to (roll, pitch, yaw)
+    roll, pitch, yaw = yaw, pitch, roll
+
+    return EgoPose(x=t[0], y=t[1], z=t[2], roll=roll, pitch=pitch, yaw=yaw)
+
+
+def compute_se2_transform(
+    nusc: NuScenes,
+    sample_token_prev: str,
+    sample_token_curr: str,
+    grid_size_m: float = 51.2,
+    grid_resolution: float = 0.8,
+) -> Optional[Dict]:
+    """
+    Compute SE(2) ego-motion transform between two consecutive samples.
+
+    Args:
+        nusc: NuScenes instance
+        sample_token_prev: Previous sample token
+        sample_token_curr: Current sample token
+        grid_size_m: BEV grid extent
+        grid_resolution: Meters per BEV cell
+
+    Returns:
+        Dict with 'dx', 'dy', 'dyaw' in grid units, or None if prev sample unavailable
+    """
+    pose_prev = get_ego_pose(nusc, sample_token_prev)
+    pose_curr = get_ego_pose(nusc, sample_token_curr)
+
+    estimator = EgoMotionEstimator(grid_size_m=grid_size_m, grid_resolution=grid_resolution)
+    se2 = estimator.estimate_from_ego_pose(pose_prev, pose_curr)
+
+    return {
+        'dx': se2.dx,
+        'dy': se2.dy,
+        'dyaw': se2.dyaw,
+    }
+
+
+
 def load_sample(
     nusc: NuScenes,
     sample_token: str,
     target_size: Tuple[int, int] = (256, 704),
 ):
     """
-    Load all 6 camera images and calibration data for a nuScenes sample.
+    Load camera image and calibration data for a nuScenes sample (monocam: CAM_FRONT only).
 
     Returns
     -------
-    images          : FloatTensor [6, 3, H, W]  (ImageNet-normalised)
-    intrinsics      : FloatTensor [6, 3, 3]
-    cam2egos        : FloatTensor [6, 4, 4]
-    img_aug_matrices: FloatTensor [6, 3, 3]  (identity — inference mode)
+    images          : FloatTensor [1, 3, H, W]  (ImageNet-normalised, monocam)
+    intrinsics      : FloatTensor [1, 3, 3]
+    cam2egos        : FloatTensor [1, 4, 4]
+    img_aug_matrices: FloatTensor [1, 3, 3]  (identity — inference mode)
+    ego_pose        : dict with 'translation' and 'rotation' keys
     sample          : raw nuScenes sample dict
     """
     sample = nusc.get('sample', sample_token)
 
-    cam_names = [
-        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-        'CAM_BACK_LEFT',  'CAM_BACK',  'CAM_BACK_RIGHT',
-    ]
+    # Use only CAM_FRONT for monocam setup
+    cam_name = 'CAM_FRONT'
+    cam_token = sample['data'][cam_name]
+    cam_data = nusc.get('sample_data', cam_token)
 
-    images, intrinsics, cam2egos, img_aug_matrices = [], [], [], []
+    img = Image.open(Path(nusc.dataroot) / cam_data['filename']).convert('RGB')
+    orig_w, orig_h = img.size
 
-    for cam_name in cam_names:
-        cam_token = sample['data'][cam_name]
-        cam_data = nusc.get('sample_data', cam_token)
+    img_resized = img.resize((target_size[1], target_size[0]))
+    img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
+    img_tensor = normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        img = Image.open(Path(nusc.dataroot) / cam_data['filename']).convert('RGB')
-        orig_w, orig_h = img.size
+    intrinsic, cam2ego = get_sensor_transforms(nusc, cam_token)
 
-        img_resized = img.resize((target_size[1], target_size[0]))
-        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
-        img_tensor = normalize(img_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        images.append(img_tensor)
+    # Scale intrinsics to match resized image
+    intrinsic_scaled = intrinsic.copy()
+    intrinsic_scaled[0, :] *= target_size[1] / orig_w
+    intrinsic_scaled[1, :] *= target_size[0] / orig_h
 
-        intrinsic, cam2ego = get_sensor_transforms(nusc, cam_token)
-
-        # Scale intrinsics to match resized image
-        intrinsic_scaled = intrinsic.copy()
-        intrinsic_scaled[0, :] *= target_size[1] / orig_w
-        intrinsic_scaled[1, :] *= target_size[0] / orig_h
-
-        intrinsics.append(torch.from_numpy(intrinsic_scaled).float())
-        cam2egos.append(torch.from_numpy(cam2ego).float())
-        img_aug_matrices.append(torch.eye(3))
+    # Get ego pose in dict format (translation + rotation)
+    lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    ego_pose = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
 
     return (
-        torch.stack(images),
-        torch.stack(intrinsics),
-        torch.stack(cam2egos),
-        torch.stack(img_aug_matrices),
+        img_tensor.unsqueeze(0),  # [1, 3, H, W] for monocam
+        torch.from_numpy(intrinsic_scaled).float().unsqueeze(0),  # [1, 3, 3]
+        torch.from_numpy(cam2ego).float().unsqueeze(0),  # [1, 4, 4]
+        torch.eye(3).unsqueeze(0),  # [1, 3, 3] for monocam
+        ego_pose,  # Raw dict from nuScenes
         sample,
     )
 

@@ -277,7 +277,7 @@ def main():
     for i, sample_token in enumerate(val_tokens):
         print(f"  [{i+1:3d}/{len(val_tokens)}] {sample_token[:8]}...", end='\r')
 
-        images, intrinsics, cam2egos, img_aug_matrices, _ = load_sample(
+        images, intrinsics, cam2egos, img_aug_matrices, ego_pose, _ = load_sample(
             nusc, sample_token
         )
         images           = images.unsqueeze(0).to(device)
@@ -289,7 +289,6 @@ def main():
             outputs = model(images, cam2egos, intrinsics, img_aug_matrices)
 
         # Decode in ego frame then transform to global frame
-        ego_pose = get_ego_pose(nusc, sample_token)
         dets = decode_to_nuscenes(
             outputs['predictions'], sample_token,
             score_threshold=SCORE_THRESHOLD,
