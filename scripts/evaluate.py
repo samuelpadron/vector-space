@@ -1,41 +1,17 @@
 """
-evaluate.py — FastBEV detection baseline validation on nuScenes mini.
+evaluate.py — FastBEV4D NDS evaluation on nuScenes mini val.
 
-Runs the FastBEV detection head on the nuScenes mini val split, saves
-predictions in the official nuScenes submission format, and computes
-NDS and mAP using the nuScenes devkit evaluator.
+Runs FastBEV4D with temporal fusion on the mini_val split,
+saves a nuScenes-format submission, and prints NDS / mAP.
 
-Purpose
--------
-This script validates that the pretrained FastBEV model produces
-geometrically meaningful camera BEV features by checking that detection
-metrics are in the expected ballpark of the published results. Without
-this check, the downstream hypothesis test results (R², residual
-heatmaps) cannot be trusted, since they assume the camera BEV features
-encode real scene geometry.
-
-Expected results
-----------------
-FastBEV (camera-only) on nuScenes full val reports NDS ≈ 0.35–0.38.
-On nuScenes mini (81 val samples) expect lower absolute numbers due
-to the small sample size, but the model should clearly outperform
-random predictions and detect the major object categories.
-
-Usage
------
-    python evaluate.py
-
-Output
-------
-    eval_output/
-        submission.json          nuScenes-format predictions
-        metrics_summary.json     NDS, mAP, per-class AP
-        metrics_details.json     full per-class breakdown
+Usage:
+    python scripts/evaluate.py [--checkpoint PATH]
 """
 
 import json
 import sys
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -44,30 +20,27 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.eval.detection.config import config_factory
 from nuscenes.eval.detection.evaluate import NuScenesEval
 from nuscenes.utils.splits import create_splits_scenes
-from collections import Counter
+
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from modules import FastBEV
-from data import load_sample, load_checkpoint
+from modules import FastBEV4D, load_checkpoint
+from data import load_sample
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 NUSCENES_ROOT   = Path('./data/nuscenes')
-CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
+NUSCENES_VER    = 'v1.0-trainval'
+NUSCENES_SPLIT  = 'val'             # eval on held-out val set
+CHECKPOINT_PATH = Path('./checkpoints/fastbev4d/epoch_19.pth')  # trained model
 EVAL_OUTPUT_DIR = Path('./eval_output')
-NUSCENES_VER    = 'v1.0-mini'
-SCORE_THRESHOLD = 0.05    # Lower than usual to capture more detections on mini
-MAX_DETS        = 500    # nuScenes allows up to 500 detections per sample
+SCORE_THRESHOLD = 0.05
+MAX_DETS        = 500
 
-# nuScenes class names in CenterHead order (must match checkpoint training order)
 CLASS_NAMES = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
     'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone',
 ]
 
-# Default attributes per class — required by nuScenes evaluator.
-# For a camera-only model without attribute prediction, we use the most
-# common attribute per category as a fixed default.
 DEFAULT_ATTRIBUTES = {
     'car':                  'vehicle.parked',
     'truck':                'vehicle.parked',
@@ -84,55 +57,18 @@ DEFAULT_ATTRIBUTES = {
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def yaw_to_quaternion(yaw: float) -> list:
-    """
-    Convert a yaw angle (rotation around z-axis) to a nuScenes quaternion
-    [w, x, y, z].  nuScenes uses the convention where the vehicle points
-    along the x-axis at yaw=0.
-    """
     q = Quaternion(axis=[0, 0, 1], angle=yaw)
     return [q.w, q.x, q.y, q.z]
 
 
-def get_ego_pose(nusc: NuScenes, sample_token: str) -> dict:
-    """
-    Return the ego pose record for a given sample.
-    The ego pose gives the vehicle's position and orientation in the
-    global (map) frame at the time of the sample's LIDAR_TOP sweep.
-    """
-    sample    = nusc.get('sample', sample_token)
-    lidar_sd  = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-    ego_pose  = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
-    return ego_pose
-
-
 def ego_to_global(det: dict, ego_pose: dict) -> dict:
-    """
-    Transform a single detection from ego frame to global frame in-place.
+    """Transform detection from ego frame to global frame."""
+    t_ego = np.array(ego_pose['translation'])
+    R_ego = Quaternion(ego_pose['rotation'])
 
-    nuScenes ego pose gives:
-      translation : [x, y, z]  — ego position in global frame
-      rotation    : [w, x, y, z] quaternion — ego orientation in global frame
-
-    For each detection:
-      global_xyz  = R_ego * det_xyz + t_ego
-      global_yaw  = det_yaw + ego_yaw   (add ego heading)
-      global_vel  = R_ego * det_vel     (rotate velocity vector)
-    """
-    t_ego = np.array(ego_pose['translation'])           # (3,)
-    R_ego = Quaternion(ego_pose['rotation'])             # pyquaternion
-
-    # Rotate + translate position
-    xyz_ego    = np.array(det['translation'])            # (3,)
-    xyz_global = R_ego.rotate(xyz_ego) + t_ego
-
-    # Rotate velocity (2-D, embed in 3-D with z=0)
-    vel_ego    = np.array([det['velocity'][0], det['velocity'][1], 0.0])
-    vel_global = R_ego.rotate(vel_ego)
-
-    # Add ego yaw to detection yaw
-    # Extract yaw from detection quaternion, add ego yaw, re-encode
-    det_q      = Quaternion(det['rotation'])
-    combined_q = R_ego * det_q
+    xyz_global = R_ego.rotate(np.array(det['translation'])) + t_ego
+    vel_global = R_ego.rotate(np.array([det['velocity'][0], det['velocity'][1], 0.0]))
+    combined_q = R_ego * Quaternion(det['rotation'])
 
     det['translation'] = xyz_global.tolist()
     det['rotation']    = [combined_q.w, combined_q.x, combined_q.y, combined_q.z]
@@ -140,90 +76,89 @@ def ego_to_global(det: dict, ego_pose: dict) -> dict:
     return det
 
 
-def decode_to_nuscenes(preds, sample_token: str,
-                        score_threshold: float = SCORE_THRESHOLD,
-                        max_dets: int = MAX_DETS) -> list:
-    """
-    Decode CenterHead predictions into nuScenes submission format.
-
-    Key differences from the visualisation decode_predictions():
-    - Returns velocity [vx, vy] from the vel head
-    - Converts yaw to quaternion
-    - Uses nuScenes class name strings
-    - Applies proper BEV coordinate convention
-
-    Parameters
-    ----------
-    preds        : raw CenterHead output (list of task dicts)
-    sample_token : nuScenes sample token for this frame
-    score_threshold, max_dets : filtering parameters
-
-    Returns
-    -------
-    list of dicts in nuScenes detection submission format
-    """
+def decode_to_nuscenes(preds, sample_token, score_threshold=SCORE_THRESHOLD,
+                        max_dets=MAX_DETS):
+    """Decode CenterHead output to nuScenes submission format."""
     import torch.nn.functional as F
 
-    task = preds[0]
+    task    = preds[0]
+    heatmap = task['heatmap'][0].sigmoid()
+    reg     = task['reg'][0]
+    height  = task['height'][0]
+    dim     = task['dim'][0]
+    rot     = task['rot'][0]
+    vel     = task['vel'][0]
 
-    heatmap = task['heatmap'][0].sigmoid()   # (C, H, W)
-    reg     = task['reg'][0]                 # (2, H, W)
-    height  = task['height'][0]              # (1, H, W)
-    dim     = task['dim'][0]                 # (3, H, W)
-    rot     = task['rot'][0]                 # (2, H, W) — sin, cos
-    vel     = task['vel'][0]                 # (2, H, W)
+    _, H, W  = heatmap.shape
+    voxel_sz = 0.8
 
-    num_classes, H, W = heatmap.shape
-    voxel_size = 0.8   # metres per BEV pixel
-
-    # Local-max NMS
-    heatmap_max = F.max_pool2d(
-        heatmap.unsqueeze(0), kernel_size=3, stride=1, padding=1
-    )[0]
-    keep = (heatmap == heatmap_max) & (heatmap >= score_threshold)
+    hm_max = F.max_pool2d(heatmap.unsqueeze(0), kernel_size=3, stride=1, padding=1)[0]
+    keep   = (heatmap == hm_max) & (heatmap >= score_threshold)
 
     detections = []
-
-    for cls_idx in range(num_classes):
+    for cls_idx in range(len(CLASS_NAMES)):
         y_idx, x_idx = torch.where(keep[cls_idx])
         for y_t, x_t in zip(y_idx, x_idx):
-            y, x = y_t.item(), x_t.item()
-            score = heatmap[cls_idx, y, x].item()
-
-            # BEV position in ego frame (metres)
-            # nuScenes BEV: x = forward, y = left
-            bev_x = (x + reg[0, y, x].item()) * voxel_size - 51.2
-            bev_y = (y + reg[1, y, x].item()) * voxel_size - 51.2
-            bev_z = height[0, y, x].item()
-
-            # Dimensions — CenterHead predicts log(dim)
-            w = float(np.exp(np.clip(dim[0, y, x].item(), -3, 3)))
-            l = float(np.exp(np.clip(dim[1, y, x].item(), -3, 3)))
-            h = float(np.exp(np.clip(dim[2, y, x].item(), -3, 3)))
-
-            # Yaw — atan2(sin, cos)
-            yaw = float(np.arctan2(rot[0, y, x].item(), rot[1, y, x].item()))
-
-            # Velocity in ego frame
-            vx = vel[0, y, x].item()
-            vy = vel[1, y, x].item()
-
-            cls_name = CLASS_NAMES[cls_idx]
-
+            y, x   = y_t.item(), x_t.item()
+            score  = heatmap[cls_idx, y, x].item()
+            bev_x  = (x + reg[0, y, x].item()) * voxel_sz - 51.2
+            bev_y  = (y + reg[1, y, x].item()) * voxel_sz - 51.2
+            bev_z  = height[0, y, x].item()
+            w      = float(np.exp(np.clip(dim[0, y, x].item(), -3, 3)))
+            l      = float(np.exp(np.clip(dim[1, y, x].item(), -3, 3)))
+            h      = float(np.exp(np.clip(dim[2, y, x].item(), -3, 3)))
+            yaw    = float(np.arctan2(rot[0, y, x].item(), rot[1, y, x].item()))
+            cls_nm = CLASS_NAMES[cls_idx]
             detections.append({
-                'sample_token':     sample_token,
-                'translation':      [bev_x, bev_y, bev_z],
-                'size':             [w, l, h],
-                'rotation':         yaw_to_quaternion(yaw),
-                'velocity':         [vx, vy],
-                'detection_name':   cls_name,
-                'detection_score':  score,
-                'attribute_name':   DEFAULT_ATTRIBUTES[cls_name],
+                'sample_token':    sample_token,
+                'translation':     [bev_x, bev_y, bev_z],
+                'size':            [w, l, h],
+                'rotation':        yaw_to_quaternion(yaw),
+                'velocity':        [vel[0, y, x].item(), vel[1, y, x].item()],
+                'detection_name':  cls_nm,
+                'detection_score': score,
+                'attribute_name':  DEFAULT_ATTRIBUTES[cls_nm],
             })
 
-    # Sort by score, keep top-N
     detections.sort(key=lambda d: d['detection_score'], reverse=True)
     return detections[:max_dets]
+
+
+def build_scene_sequence(nusc, val_tokens):
+    """
+    Group val tokens by scene and sort each scene chronologically.
+    Returns list of scenes, each a list of sample tokens in time order.
+    """
+    scene_map = defaultdict(list)
+    token_set = set(val_tokens)
+
+    for sample in nusc.sample:
+        if sample['token'] in token_set:
+            scene_map[sample['scene_token']].append(sample)
+
+    scenes = []
+    for scene_samples in scene_map.values():
+        # Sort by timestamp
+        scene_samples.sort(key=lambda s: s['timestamp'])
+        scenes.append([s['token'] for s in scene_samples])
+
+    return scenes
+
+
+def compute_se2(ego_prev: dict, ego_curr: dict, grid_res: float = 0.8) -> torch.Tensor:
+    """SE(2) between two nuScenes ego_pose dicts. Returns [1, 3] tensor."""
+    t_prev = np.array(ego_prev['translation'])
+    t_curr = np.array(ego_curr['translation'])
+    q_prev = Quaternion(ego_prev['rotation'])
+    q_curr = Quaternion(ego_curr['rotation'])
+
+    dx_m  = t_curr[0] - t_prev[0]
+    dy_m  = t_curr[1] - t_prev[1]
+    dyaw  = q_curr.yaw_pitch_roll[0] - q_prev.yaw_pitch_roll[0]
+    dyaw  = (dyaw + np.pi) % (2 * np.pi) - np.pi
+
+    return torch.tensor([[dx_m / grid_res, dy_m / grid_res, dyaw]],
+                        dtype=torch.float32)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -231,11 +166,11 @@ def decode_to_nuscenes(preds, sample_token: str,
 def main():
     EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    # ── Load model ────────────────────────────────────────────────────────
-    print("\nCreating FastBEV model...")
-    model = FastBEV(
+    # ── Model ─────────────────────────────────────────────────────────────────
+    print("\nLoading FastBEV4D...")
+    model = FastBEV4D(
         in_channels=256,
         bev_channels=64,
         out_channels=256,
@@ -245,135 +180,117 @@ def main():
     )
 
     if not CHECKPOINT_PATH.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found at {CHECKPOINT_PATH}. "
-            "Cannot validate baseline without pretrained weights."
-        )
+        raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
 
-    model = load_checkpoint(model, CHECKPOINT_PATH, device)
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+    # Support both raw state_dict and training checkpoint format
+    state = ckpt.get('model', ckpt)
+    model.load_state_dict(state, strict=False)
+
     model = model.to(device).eval()
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── Load nuScenes ─────────────────────────────────────────────────────
+    # ── nuScenes ──────────────────────────────────────────────────────────────
     print(f"\nLoading nuScenes {NUSCENES_VER}...")
-    nusc = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
-
-    # Get val split tokens
-    # nuScenes mini val split is defined in the splits file
-    from nuscenes.utils.splits import create_splits_scenes
-    splits     = create_splits_scenes()
-    val_scenes = set(splits['mini_val'])
-
+    nusc       = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
+    val_scenes = set(create_splits_scenes()[NUSCENES_SPLIT])
     val_tokens = [
         s['token'] for s in nusc.sample
         if nusc.get('scene', s['scene_token'])['name'] in val_scenes
     ]
     print(f"  Val samples: {len(val_tokens)}")
 
-    # ── Run inference ─────────────────────────────────────────────────────
-    print("\nRunning inference on val set...")
+    scenes = build_scene_sequence(nusc, val_tokens)
+
+    # ── Inference with temporal context ───────────────────────────────────────
+    print("\nRunning inference...")
     all_results = {}
+    total = sum(len(s) for s in scenes)
+    done  = 0
 
-    for i, sample_token in enumerate(val_tokens):
-        print(f"  [{i+1:3d}/{len(val_tokens)}] {sample_token[:8]}...", end='\r')
+    for scene_tokens in scenes:
+        bev_feat_prev = None
+        ego_pose_prev = None
 
-        images, intrinsics, cam2egos, img_aug_matrices, ego_pose, _ = load_sample(
-            nusc, sample_token
-        )
-        images           = images.unsqueeze(0).to(device)
-        intrinsics       = intrinsics.unsqueeze(0).to(device)
-        cam2egos         = cam2egos.unsqueeze(0).to(device)
-        img_aug_matrices = img_aug_matrices.unsqueeze(0).to(device)
+        for token in scene_tokens:
+            done += 1
+            print(f"  [{done:3d}/{total}]", end='\r')
 
-        with torch.no_grad():
-            outputs = model(images, cam2egos, intrinsics, img_aug_matrices)
+            # load_sample already returns [1, 3, H, W] / [1, 4, 4] / [1, 3, 3]
+            img, intr, c2e, _, ego_pose, _ = load_sample(nusc, token)
+            img  = img.to(device)
+            intr = intr.to(device)
+            c2e  = c2e.to(device)
 
-        # Decode in ego frame then transform to global frame
-        dets = decode_to_nuscenes(
-            outputs['predictions'], sample_token,
-            score_threshold=SCORE_THRESHOLD,
-        )
-        dets = [ego_to_global(d, ego_pose) for d in dets]
-        all_results[sample_token] = dets
+            # SE(2) from previous frame (None on scene-first frame)
+            se2 = None
+            if ego_pose_prev is not None:
+                se2 = compute_se2(ego_pose_prev, ego_pose).to(device)
 
-    print(f"\n  Done. Total detections: {sum(len(v) for v in all_results.values())}")
+            with torch.no_grad():
+                outputs = model(
+                    img, c2e, intr,
+                    bev_feat_prev=bev_feat_prev,
+                    se2=se2,
+                )
 
-    # ── Save submission JSON ───────────────────────────────────────────────
+            # Cache pre-fusion encoder output as prev for next frame (BEVDet4D convention)
+            bev_feat_prev = outputs['bev_feat_enc'].detach()
+            ego_pose_prev = ego_pose
+
+            # Decode and transform to global frame
+            dets = decode_to_nuscenes(outputs['predictions'], token)
+            dets = [ego_to_global(d, ego_pose) for d in dets]
+            all_results[token] = dets
+
+    print(f"\n  Total detections: {sum(len(v) for v in all_results.values())}")
+
+    # ── Save submission ────────────────────────────────────────────────────────
     submission = {
-        "meta": {
-            "use_camera":   True,
-            "use_lidar":    False,
-            "use_radar":    False,
-            "use_map":      False,
-            "use_external": False,
+        'meta': {
+            'use_camera': True, 'use_lidar': False,
+            'use_radar':  False, 'use_map':   False, 'use_external': False,
         },
-        "results": all_results,
+        'results': all_results,
     }
-
     submission_path = EVAL_OUTPUT_DIR / 'submission.json'
     with open(submission_path, 'w') as f:
         json.dump(submission, f)
-    print(f"\nSaved submission → {submission_path}")
+    print(f"Saved submission → {submission_path}")
 
-    # ── Run nuScenes evaluation ────────────────────────────────────────────
+    # ── NuScenes eval ─────────────────────────────────────────────────────────
     print("\nRunning nuScenes evaluation...")
-    cfg = config_factory('detection_cvpr_2019')
-
-    nusc_eval = NuScenesEval(
+    cfg      = config_factory('detection_cvpr_2019')
+    evaluator = NuScenesEval(
         nusc,
         config=cfg,
         result_path=str(submission_path),
-        eval_set='mini_val',
+        eval_set=NUSCENES_SPLIT,
         output_dir=str(EVAL_OUTPUT_DIR),
-        verbose=True,
+        verbose=False,
     )
+    metrics, _ = evaluator.evaluate()
 
-    metrics, metric_data_list = nusc_eval.evaluate()
-
-    # ── Print summary ──────────────────────────────────────────────────────
-    print("\n" + "═" * 55)
-    print("  FASTBEV BASELINE VALIDATION — nuScenes mini val")
-    print("═" * 55)
+    print("\n" + "=" * 55)
+    print("  FastBEV4D — nuScenes mini val")
+    print("=" * 55)
     print(f"  NDS  : {metrics.nd_score:.4f}")
     print(f"  mAP  : {metrics.mean_ap:.4f}")
     print()
     print("  Per-class AP:")
-    for cls_name in CLASS_NAMES:
-        ap = metrics.mean_dist_aps.get(cls_name, 0.0)
-        print(f"    {cls_name:<25s} {ap:.4f}")
-    print("═" * 55)
-    print()
-    print("  Published FastBEV (camera-only, full val): NDS ≈ 0.35–0.38")
-    print("  Note: lower absolute numbers expected on mini val (81 samples).")
-    print("  The model is valid if major categories (car, pedestrian) show")
-    print("  non-trivial AP and NDS is clearly above random (≈ 0.0).")
-    print("═" * 55)
+    for cls in CLASS_NAMES:
+        print(f"    {cls:<25s} {metrics.mean_dist_aps.get(cls, 0.0):.4f}")
+    print("=" * 55)
 
-    # Save summary for reference
     summary = {
-        'nds':  metrics.nd_score,
-        'map':  metrics.mean_ap,
-        'per_class_ap': {
-            cls: metrics.mean_dist_aps.get(cls, 0.0)
-            for cls in CLASS_NAMES
-        },
-        'note': (
-            'Evaluated on nuScenes mini val (81 samples). '
-            'Lower than full val results expected due to dataset size.'
-        ),
+        'nds': metrics.nd_score,
+        'map': metrics.mean_ap,
+        'per_class_ap': {c: metrics.mean_dist_aps.get(c, 0.0) for c in CLASS_NAMES},
     }
     with open(EVAL_OUTPUT_DIR / 'metrics_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"\nMetrics saved → {EVAL_OUTPUT_DIR / 'metrics_summary.json'}")
+    print(f"Metrics saved → {EVAL_OUTPUT_DIR / 'metrics_summary.json'}")
 
-
-    with open('eval_output/submission.json') as f:
-        sub = json.load(f)
-
-    all_dets = [d for dets in sub['results'].values() for d in dets]
-    print(Counter(d['detection_name'] for d in all_dets))
-    print(f"Total: {len(all_dets)}")
-    
 
 if __name__ == '__main__':
     main()

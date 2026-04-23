@@ -5,8 +5,7 @@ and detection decoding.
 """
 
 from pathlib import Path
-from typing import Tuple, Optional, Dict
-import sys
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -15,10 +14,6 @@ from PIL import Image
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 from torchvision.transforms.functional import normalize
-
-# Add src to path for ego_motion import
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from modules.ego_motion import EgoMotionEstimator, EgoPose
 
 
 def get_sensor_transforms(nusc: NuScenes, sample_data_token: str):
@@ -35,63 +30,6 @@ def get_sensor_transforms(nusc: NuScenes, sample_data_token: str):
     cam2ego[:3, 3] = np.array(cs['translation'])
 
     return intrinsic, cam2ego
-
-
-def get_ego_pose(nusc: NuScenes, sample_token: str) -> EgoPose:
-    """
-    Extract ego pose (position and rotation) for a nuScenes sample.
-
-    Args:
-        nusc: NuScenes instance
-        sample_token: Sample token
-
-    Returns:
-        EgoPose with x, y, z, roll, pitch, yaw
-    """
-    sample = nusc.get('sample', sample_token)
-    lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-    ego_pose_dict = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
-
-    t = np.array(ego_pose_dict['translation'])
-    q = Quaternion(ego_pose_dict['rotation'])
-    roll, pitch, yaw = q.yaw_pitch_roll  # yaw_pitch_roll returns (yaw, pitch, roll)
-    # Reorder to (roll, pitch, yaw)
-    roll, pitch, yaw = yaw, pitch, roll
-
-    return EgoPose(x=t[0], y=t[1], z=t[2], roll=roll, pitch=pitch, yaw=yaw)
-
-
-def compute_se2_transform(
-    nusc: NuScenes,
-    sample_token_prev: str,
-    sample_token_curr: str,
-    grid_size_m: float = 51.2,
-    grid_resolution: float = 0.8,
-) -> Optional[Dict]:
-    """
-    Compute SE(2) ego-motion transform between two consecutive samples.
-
-    Args:
-        nusc: NuScenes instance
-        sample_token_prev: Previous sample token
-        sample_token_curr: Current sample token
-        grid_size_m: BEV grid extent
-        grid_resolution: Meters per BEV cell
-
-    Returns:
-        Dict with 'dx', 'dy', 'dyaw' in grid units, or None if prev sample unavailable
-    """
-    pose_prev = get_ego_pose(nusc, sample_token_prev)
-    pose_curr = get_ego_pose(nusc, sample_token_curr)
-
-    estimator = EgoMotionEstimator(grid_size_m=grid_size_m, grid_resolution=grid_resolution)
-    se2 = estimator.estimate_from_ego_pose(pose_prev, pose_curr)
-
-    return {
-        'dx': se2.dx,
-        'dy': se2.dy,
-        'dyaw': se2.dyaw,
-    }
 
 
 
@@ -306,6 +244,14 @@ def load_gt_boxes(nusc, sample_token: str) -> list:
 
         w, l, h = ann['size']   # nuScenes: [width, length, height]
 
+        # Velocity: finite-difference from nuScenes (NaN for first/last in track)
+        vel_global = nusc.box_velocity(ann['token'])   # [vx, vy, vz] global m/s
+        if _np.any(_np.isnan(vel_global)):
+            vx_ego, vy_ego = 0.0, 0.0
+        else:
+            vel_ego = R_ego.inverse.rotate(vel_global)
+            vx_ego, vy_ego = float(vel_ego[0]), float(vel_ego[1])
+
         gt_boxes.append({
             'x':     float(xyz_ego[0]),   # forward
             'y':     float(xyz_ego[1]),   # left
@@ -314,6 +260,8 @@ def load_gt_boxes(nusc, sample_token: str) -> list:
             'l':     float(l),
             'h':     float(h),
             'yaw':   float(yaw_ego),
+            'vx':    vx_ego,
+            'vy':    vy_ego,
             'class': cls_idx,
             'name':  cls_name,
         })
