@@ -28,7 +28,6 @@ CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
 NUM_EPOCHS  = 20
-LR_BACKBONE = 2e-5   # pretrained weights — keep small
 LR_FUSION   = 2e-4   # temporal_fusion is new — can learn faster
 GRAD_CLIP   = 35.0
 LOG_EVERY   = 10     # steps between loss prints
@@ -56,16 +55,17 @@ def main():
         print(f"  Warning: checkpoint not found at {CHECKPOINT_PATH}, training from scratch")
 
     model = model.to(device)
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    total  = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.temporal_fusion.parameters())
+    print(f"  Parameters: {total:,} total, {trainable:,} trainable (fusion only)")
 
-    fusion_ids  = set(id(p) for p in model.temporal_fusion.parameters())
-    backbone_ps = [p for p in model.parameters() if id(p) not in fusion_ids]
-    fusion_ps   = list(model.temporal_fusion.parameters())
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in model.temporal_fusion.parameters():
+        p.requires_grad_(True)
 
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_ps, 'lr': LR_BACKBONE},
-        {'params': fusion_ps,   'lr': LR_FUSION},
-    ], weight_decay=1e-4)
+    fusion_ps = list(model.temporal_fusion.parameters())
+    optimizer = torch.optim.AdamW(fusion_ps, lr=LR_FUSION, weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=NUM_EPOCHS, eta_min=1e-6
@@ -87,7 +87,8 @@ def main():
 
     print("\nStarting training...\n")
     for epoch in range(NUM_EPOCHS):
-        model.train()
+        model.eval()
+        model.temporal_fusion.train()
         epoch_loss = 0.0
 
         for step, batch in enumerate(loader):
@@ -130,7 +131,7 @@ def main():
 
         scheduler.step()
         avg = epoch_loss / len(loader)
-        lr  = scheduler.get_last_lr()[1]   # fusion head LR
+        lr  = scheduler.get_last_lr()[0]
         print(f"\nEpoch {epoch:02d} complete — avg loss: {avg:.4f}  lr: {lr:.2e}\n")
 
         if epoch % SAVE_EVERY == 0:
