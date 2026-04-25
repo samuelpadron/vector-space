@@ -105,12 +105,11 @@ class FastrayTransformer(nn.Module):
         std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
         img_denorm = (img * std + mean).clamp(0, 1)
 
-        depth_maps = []
-        for b_idx in range(B):
-            img_pil = to_pil_image(img_denorm[b_idx].cpu())
-            d = self.depth_pipeline(img_pil)["depth"]
-            d_tensor = torch.from_numpy(np.array(d)).float()
-            depth_maps.append(d_tensor)
+        pil_imgs = [to_pil_image(img_denorm[b_idx].cpu()) for b_idx in range(B)]
+        depth_maps = [
+            torch.from_numpy(np.array(r["depth"])).float()
+            for r in self.depth_pipeline(pil_imgs, batch_size=B)
+        ]
 
         depth = torch.stack(depth_maps).to(device)
         depth = F.interpolate(depth.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False).squeeze(1)
