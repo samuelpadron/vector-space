@@ -63,7 +63,7 @@ class BEVWarp(nn.Module):
         ], dim=1)  # [B, 2, 3]
 
         # Generate sampling grid
-        grid = F.affine_grid(affine_matrices, size=(B, C, H, W))
+        grid = F.affine_grid(affine_matrices, size=(B, C, H, W), align_corners=False)
 
         # Warp using bilinear interpolation, pad with zeros for out-of-bounds
         warped = F.grid_sample(

@@ -23,10 +23,20 @@ class NuScenesSequenceDataset(Dataset):
     First frames of each scene (no prev) are excluded so every item has
     a valid previous frame.
 
-    Args:
-        nusc:        NuScenes instance (v1.0-mini or v1.0-trainval)
-        split:       'train' | 'val' | 'mini_train' | 'mini_val'
-        target_size: (H, W) image resize target
+    Tensor shapes returned (monocam, N=1):
+        img_curr / img_prev        : [1, 3, H, W]
+        cam2ego_curr / cam2ego_prev: [1, 4, 4]
+        intrinsics_curr / _prev    : [1, 3, 3]
+        se2                        : [3]
+        gt_boxes                   : list[dict]
+
+    After collate_fn the leading batch dim is added, giving:
+        img_*       : [B, 1, 3, H, W]
+        cam2ego_*   : [B, 1, 4, 4]
+        intrinsics_*: [B, 1, 3, 3]
+
+    The N=1 dimension is kept (not squeezed) so the model's N-camera
+    API works without modification for both mono and surround-view.
     """
 
     def __init__(self, nusc, split='train', target_size=(256, 704)):
@@ -35,8 +45,6 @@ class NuScenesSequenceDataset(Dataset):
 
         valid_scenes = set(create_splits_scenes()[split])
 
-        # Only keep samples that (a) belong to the requested split scene and
-        # (b) have a previous frame in the same scene
         self.sample_tokens = [
             s['token'] for s in nusc.sample
             if s['prev'] != ''
@@ -47,9 +55,9 @@ class NuScenesSequenceDataset(Dataset):
         return len(self.sample_tokens)
 
     def __getitem__(self, idx):
-        token_curr   = self.sample_tokens[idx]
-        sample_curr  = self.nusc.get('sample', token_curr)
-        token_prev   = sample_curr['prev']
+        token_curr  = self.sample_tokens[idx]
+        sample_curr = self.nusc.get('sample', token_curr)
+        token_prev  = sample_curr['prev']
 
         img_curr, intr_curr, c2e_curr, _, ego_curr, _ = load_sample(
             self.nusc, token_curr, self.target_size
@@ -58,32 +66,35 @@ class NuScenesSequenceDataset(Dataset):
             self.nusc, token_prev, self.target_size
         )
 
+        # load_sample already returns [N, ...] tensors (N=1 for monocam).
+        # Do NOT squeeze — the model expects the N dimension to be present.
+        # Shapes here: img [1,3,H,W], c2e [1,4,4], intr [1,3,3]
+
         se2      = _compute_se2(ego_prev, ego_curr)
         gt_boxes = load_gt_boxes(self.nusc, token_curr)
 
         return {
-            # squeeze the leading cam-count dim (monocam → [3, H, W] / [4,4] / [3,3])
-            'img_curr':        img_curr.squeeze(0),
-            'cam2ego_curr':    c2e_curr.squeeze(0),
-            'intrinsics_curr': intr_curr.squeeze(0),
-            'img_prev':        img_prev.squeeze(0),
-            'cam2ego_prev':    c2e_prev.squeeze(0),
-            'intrinsics_prev': intr_prev.squeeze(0),
-            'se2':             se2,          # [3]  (dx_grid, dy_grid, dyaw)
-            'gt_boxes':        gt_boxes,     # list[dict] — kept as-is, collated below
+            'img_curr':        img_curr,    # [1, 3, H, W]
+            'cam2ego_curr':    c2e_curr,    # [1, 4, 4]
+            'intrinsics_curr': intr_curr,   # [1, 3, 3]
+            'img_prev':        img_prev,    # [1, 3, H, W]
+            'cam2ego_prev':    c2e_prev,    # [1, 4, 4]
+            'intrinsics_prev': intr_prev,   # [1, 3, 3]
+            'se2':             se2,         # [3]
+            'gt_boxes':        gt_boxes,    # list[dict]
         }
 
 
 def collate_fn(batch):
-    """Stack tensors; keep gt_boxes as a list of lists (variable length)."""
+    """Stack tensors; keep gt_boxes as a list (variable-length per sample)."""
     return {
-        'img_curr':        torch.stack([b['img_curr']        for b in batch]),
-        'cam2ego_curr':    torch.stack([b['cam2ego_curr']    for b in batch]),
-        'intrinsics_curr': torch.stack([b['intrinsics_curr'] for b in batch]),
-        'img_prev':        torch.stack([b['img_prev']        for b in batch]),
-        'cam2ego_prev':    torch.stack([b['cam2ego_prev']    for b in batch]),
-        'intrinsics_prev': torch.stack([b['intrinsics_prev'] for b in batch]),
-        'se2':             torch.stack([b['se2']             for b in batch]),
+        'img_curr':        torch.stack([b['img_curr']        for b in batch]),  # [B,1,3,H,W]
+        'cam2ego_curr':    torch.stack([b['cam2ego_curr']    for b in batch]),  # [B,1,4,4]
+        'intrinsics_curr': torch.stack([b['intrinsics_curr'] for b in batch]),  # [B,1,3,3]
+        'img_prev':        torch.stack([b['img_prev']        for b in batch]),  # [B,1,3,H,W]
+        'cam2ego_prev':    torch.stack([b['cam2ego_prev']    for b in batch]),  # [B,1,4,4]
+        'intrinsics_prev': torch.stack([b['intrinsics_prev'] for b in batch]),  # [B,1,3,3]
+        'se2':             torch.stack([b['se2']             for b in batch]),  # [B,3]
         'gt_boxes':        [b['gt_boxes'] for b in batch],
     }
 

@@ -1,11 +1,14 @@
 """
 run.py — FastBEV4D training entry point.
 
-Trains the temporal-fusion model (BEVDet4D-style, Option A: concat + 1x1 conv)
+Trains the temporal-fusion model (BEVDet4D-style, concat + 1x1 conv)
 on top of a pretrained FastBEV backbone.
 
-Usage:
-    python run.py
+Tensor conventions (monocam, N=1)
+----------------------------------
+imgs        : [B, 1, 3, H, W]
+cam2ego     : [B, 1, 4, 4]
+intrinsics  : [B, 1, 3, 3]
 """
 
 import json
@@ -28,10 +31,11 @@ CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
 NUM_EPOCHS  = 20
-LR_FUSION   = 2e-4   # temporal_fusion is new — can learn faster
+LR_FUSION   = 2e-4
+LR_DEPTH    = 1e-4
 GRAD_CLIP   = 35.0
-LOG_EVERY   = 10     # steps between loss prints
-VAL_EVERY   = 5      # epochs between validation runs
+LOG_EVERY   = 10
+VAL_EVERY   = 5
 
 
 def main():
@@ -55,39 +59,45 @@ def main():
         print(f"  Warning: checkpoint not found at {CHECKPOINT_PATH}, training from scratch")
 
     model = model.to(device)
-    total  = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.temporal_fusion.parameters())
-    print(f"  Parameters: {total:,} total, {trainable:,} trainable (fusion only)")
 
     for p in model.parameters():
         p.requires_grad_(False)
+
+    for p in model.img_view_transformer.depth_net.parameters():
+        p.requires_grad_(True)
+
     for p in model.temporal_fusion.parameters():
         p.requires_grad_(True)
 
-    fusion_ps = list(model.temporal_fusion.parameters())
-    optimizer = torch.optim.AdamW(fusion_ps, lr=LR_FUSION, weight_decay=1e-4)
+    n_total     = sum(p.numel() for p in model.parameters())
+    n_depth     = sum(p.numel() for p in model.img_view_transformer.depth_net.parameters())
+    n_fusion    = sum(p.numel() for p in model.temporal_fusion.parameters())
+    n_trainable = n_depth + n_fusion
+    print(f"  Parameters: {n_total:,} total, {n_trainable:,} trainable "
+          f"(depth_net={n_depth:,}, fusion={n_fusion:,})")
+
+    # separate LRs: fusion can move faster since it's a small new module
+    optimizer = torch.optim.AdamW([
+        {'params': model.img_view_transformer.depth_net.parameters(), 'lr': LR_DEPTH},
+        {'params': model.temporal_fusion.parameters(),                 'lr': LR_FUSION},
+    ], weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=NUM_EPOCHS, eta_min=1e-6
     )
 
     print("\nLoading nuScenes...")
-    nusc       = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
-    train_set  = NuScenesSequenceDataset(nusc, split='train')
-    val_set    = NuScenesSequenceDataset(nusc, split='val')
+    nusc      = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
+    train_set = NuScenesSequenceDataset(nusc, split='train')
+    val_set   = NuScenesSequenceDataset(nusc, split='val')
+
     loader = DataLoader(
-        train_set,
-        batch_size=1,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,   # NuScenes object not picklable across workers
+        train_set, batch_size=1, shuffle=True,
+        collate_fn=collate_fn, num_workers=0,
     )
     val_loader = DataLoader(
-        val_set,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
+        val_set, batch_size=1, shuffle=False,
+        collate_fn=collate_fn, num_workers=0,
     )
     print(f"  {len(train_set)} train pairs, {len(val_set)} val pairs")
 
@@ -95,7 +105,8 @@ def main():
 
     def run_epoch(loader, train=True):
         if train:
-            model.eval()
+            model.eval()                              # keep BN/dropout frozen…
+            model.img_view_transformer.depth_net.train()  # …except the new modules
             model.temporal_fusion.train()
         else:
             model.eval()
@@ -103,24 +114,24 @@ def main():
         total_loss = 0.0
         with torch.set_grad_enabled(train):
             for step, batch in enumerate(loader):
-                img_curr  = batch['img_curr'].to(device)
-                c2e_curr  = batch['cam2ego_curr'].to(device)
-                intr_curr = batch['intrinsics_curr'].to(device)
-                img_prev  = batch['img_prev'].to(device)
-                c2e_prev  = batch['cam2ego_prev'].to(device)
-                intr_prev = batch['intrinsics_prev'].to(device)
-                se2       = batch['se2'].to(device)
-                gt_boxes  = batch['gt_boxes']
+                imgs_curr  = batch['img_curr'].to(device)       # [B, 1, 3, H, W]
+                c2e_curr   = batch['cam2ego_curr'].to(device)   # [B, 1, 4, 4]
+                intr_curr  = batch['intrinsics_curr'].to(device)# [B, 1, 3, 3]
+                imgs_prev  = batch['img_prev'].to(device)       # [B, 1, 3, H, W]
+                c2e_prev   = batch['cam2ego_prev'].to(device)   # [B, 1, 4, 4]
+                intr_prev  = batch['intrinsics_prev'].to(device)# [B, 1, 3, 3]
+                se2        = batch['se2'].to(device)            # [B, 3]
+                gt_boxes   = batch['gt_boxes']
 
                 with torch.no_grad():
-                    bev_feat_prev, _ = model.encode(img_prev, c2e_prev, intr_prev)
+                    bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
                 bev_feat_prev = bev_feat_prev.detach()
 
                 if train:
                     optimizer.zero_grad()
 
                 outputs = model(
-                    img_curr, c2e_curr, intr_curr,
+                    imgs_curr, c2e_curr, intr_curr,
                     bev_feat_prev=bev_feat_prev,
                     se2=se2,
                 )
@@ -128,7 +139,9 @@ def main():
 
                 if train:
                     losses['loss'].backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], GRAD_CLIP
+                    )
                     optimizer.step()
 
                     if step % LOG_EVERY == 0:
@@ -151,8 +164,10 @@ def main():
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
         train_loss = run_epoch(loader, train=True)
         scheduler.step()
-        lr = scheduler.get_last_lr()[0]
-        print(f"  train loss: {train_loss:.4f}  lr: {lr:.2e}")
+        lr_depth  = optimizer.param_groups[0]['lr']
+        lr_fusion = optimizer.param_groups[1]['lr']
+        print(f"  train loss: {train_loss:.4f}  "
+              f"lr_depth={lr_depth:.2e}  lr_fusion={lr_fusion:.2e}")
 
         val_loss = None
         if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
@@ -180,7 +195,8 @@ def main():
             'epoch':      epoch,
             'train_loss': train_loss,
             'val_loss':   val_loss,
-            'lr':         lr,
+            'lr_depth':   lr_depth,
+            'lr_fusion':  lr_fusion,
         })
         with open(SAVE_DIR / 'log.json', 'w') as f:
             json.dump(history, f, indent=2)
