@@ -36,16 +36,19 @@ def _render_heatmap(gt_boxes, num_classes: int, H: int, W: int,
     for box in gt_boxes:
         cls = box['class']
         px, py = _metre_to_pixel(box['x'], box['y'])
+        xi, yi = int(px), int(py)
 
-        if not (0 <= px < W and 0 <= py < H):
+        if not (0 <= xi < W and 0 <= yi < H):
             continue
 
         # Gaussian radius ~ half the smaller box dimension
         radius = max(2.0, min(box['w'], box['l']) / (2.0 * VOXEL_SIZE))
         sigma  = radius / 3.0
 
+        # Center on the integer pixel so the peak is exactly 1.0,
+        # which is required for pos_mask = target.eq(1) in the focal loss.
         gaussian = torch.exp(
-            -((grid_x - px) ** 2 + (grid_y - py) ** 2) / (2 * sigma ** 2)
+            -((grid_x - xi) ** 2 + (grid_y - yi) ** 2) / (2 * sigma ** 2)
         )
         heatmap[cls] = torch.maximum(heatmap[cls], gaussian)
 
