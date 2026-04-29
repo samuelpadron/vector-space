@@ -31,9 +31,8 @@ CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
 NUM_EPOCHS  = 20
-LR_FUSION   = 2e-4
-LR_DEPTH    = 1e-4
-GRAD_CLIP   = 35.0
+LR_FUSION   = 1e-3
+GRAD_CLIP   = 5.0
 LOG_EVERY   = 10
 VAL_EVERY   = 5
 
@@ -60,30 +59,26 @@ def main():
 
     model = model.to(device)
 
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    for p in model.img_view_transformer.depth_net.parameters():
-        p.requires_grad_(True)
-
-    for p in model.temporal_fusion.parameters():
-        p.requires_grad_(True)
+    for name, param in model.named_parameters():
+        if name.startswith('temporal_fusion') or name.startswith('pts_bbox_head'):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     n_total     = sum(p.numel() for p in model.parameters())
-    n_depth     = sum(p.numel() for p in model.img_view_transformer.depth_net.parameters())
     n_fusion    = sum(p.numel() for p in model.temporal_fusion.parameters())
-    n_trainable = n_depth + n_fusion
+    n_head      = sum(p.numel() for p in model.pts_bbox_head.parameters())
+    n_trainable = n_fusion + n_head
     print(f"  Parameters: {n_total:,} total, {n_trainable:,} trainable "
-          f"(depth_net={n_depth:,}, fusion={n_fusion:,})")
+          f"(fusion={n_fusion:,}, head={n_head:,})")
 
-    # separate LRs: fusion can move faster since it's a small new module
     optimizer = torch.optim.AdamW([
-        {'params': model.img_view_transformer.depth_net.parameters(), 'lr': LR_DEPTH},
-        {'params': model.temporal_fusion.parameters(),                 'lr': LR_FUSION},
+        {'params': model.temporal_fusion.parameters(), 'lr': LR_FUSION},
+        {'params': model.pts_bbox_head.parameters(),   'lr': LR_FUSION},
     ], weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS, eta_min=1e-6
+        optimizer, T_max=NUM_EPOCHS, eta_min=1e-5
     )
 
     print("\nLoading nuScenes...")
@@ -92,12 +87,12 @@ def main():
     val_set   = NuScenesSequenceDataset(nusc, split='val')
 
     loader = DataLoader(
-        train_set, batch_size=1, shuffle=True,
-        collate_fn=collate_fn, num_workers=0,
+        train_set, batch_size=4, shuffle=True,
+        collate_fn=collate_fn, num_workers=4,
     )
     val_loader = DataLoader(
-        val_set, batch_size=1, shuffle=False,
-        collate_fn=collate_fn, num_workers=0,
+        val_set, batch_size=4, shuffle=False,
+        collate_fn=collate_fn, num_workers=4,
     )
     print(f"  {len(train_set)} train pairs, {len(val_set)} val pairs")
 
@@ -105,9 +100,9 @@ def main():
 
     def run_epoch(loader, train=True):
         if train:
-            model.eval()                              # keep BN/dropout frozen…
-            model.img_view_transformer.depth_net.train()  # …except the new modules
+            model.eval()                    # keep frozen encoder BN in eval mode
             model.temporal_fusion.train()
+            model.pts_bbox_head.train()
         else:
             model.eval()
 
@@ -164,10 +159,8 @@ def main():
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
         train_loss = run_epoch(loader, train=True)
         scheduler.step()
-        lr_depth  = optimizer.param_groups[0]['lr']
-        lr_fusion = optimizer.param_groups[1]['lr']
-        print(f"  train loss: {train_loss:.4f}  "
-              f"lr_depth={lr_depth:.2e}  lr_fusion={lr_fusion:.2e}")
+        lr_fusion = optimizer.param_groups[0]['lr']
+        print(f"  train loss: {train_loss:.4f}  lr={lr_fusion:.2e}")
 
         val_loss = None
         if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
@@ -195,8 +188,7 @@ def main():
             'epoch':      epoch,
             'train_loss': train_loss,
             'val_loss':   val_loss,
-            'lr_depth':   lr_depth,
-            'lr_fusion':  lr_fusion,
+            'lr':         lr_fusion,
         })
         with open(SAVE_DIR / 'log.json', 'w') as f:
             json.dump(history, f, indent=2)
