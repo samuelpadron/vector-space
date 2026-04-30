@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from nuscenes.nuscenes import NuScenes
 
@@ -30,7 +31,7 @@ NUSCENES_VER    = 'v1.0-trainval'
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
-NUM_EPOCHS  = 20
+NUM_EPOCHS  = 40
 LR_FUSION   = 1e-3
 GRAD_CLIP   = 5.0
 LOG_EVERY   = 10
@@ -58,6 +59,7 @@ def main():
         print(f"  Warning: checkpoint not found at {CHECKPOINT_PATH}, training from scratch")
 
     model = model.to(device)
+    scaler = GradScaler()
 
     for name, param in model.named_parameters():
         if name.startswith('temporal_fusion') or name.startswith('pts_bbox_head'):
@@ -78,7 +80,7 @@ def main():
     ], weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS, eta_min=1e-5
+        optimizer, T_max=40, eta_min=1e-5
     )
 
     print("\nLoading nuScenes...")
@@ -87,12 +89,14 @@ def main():
     val_set   = NuScenesSequenceDataset(nusc, split='val')
 
     loader = DataLoader(
-        train_set, batch_size=4, shuffle=True,
-        collate_fn=collate_fn, num_workers=4,
+        train_set, batch_size=8, shuffle=True,
+        collate_fn=collate_fn, num_workers=6,
+        pin_memory=True, persistent_workers=True
     )
     val_loader = DataLoader(
-        val_set, batch_size=4, shuffle=False,
-        collate_fn=collate_fn, num_workers=4,
+        val_set, batch_size=8, shuffle=False,
+        collate_fn=collate_fn, num_workers=6,
+        pin_memory=True, persistent_workers=True
     )
     print(f"  {len(train_set)} train pairs, {len(val_set)} val pairs")
 
@@ -122,22 +126,24 @@ def main():
                     bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
                 bev_feat_prev = bev_feat_prev.detach()
 
-                if train:
-                    optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-                outputs = model(
-                    imgs_curr, c2e_curr, intr_curr,
-                    bev_feat_prev=bev_feat_prev,
-                    se2=se2,
-                )
-                losses = criterion(outputs['predictions'], gt_boxes)
+                with autocast():
+                    outputs = model(
+                        imgs_curr, c2e_curr, intr_curr,
+                        bev_feat_prev=bev_feat_prev,
+                        se2=se2,
+                    )
+                    losses = criterion(outputs['predictions'], gt_boxes)
 
                 if train:
-                    losses['loss'].backward()
+                    scaler.scale(losses['loss']).backward()
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad], GRAD_CLIP
                     )
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     if step % LOG_EVERY == 0:
                         print(

@@ -74,6 +74,7 @@ class NuScenesSequenceDataset(Dataset):
         gt_boxes = load_gt_boxes(self.nusc, token_curr)
 
         return {
+            'idx':             idx,
             'img_curr':        img_curr,    # [1, 3, H, W]
             'cam2ego_curr':    c2e_curr,    # [1, 4, 4]
             'intrinsics_curr': intr_curr,   # [1, 3, 3]
@@ -88,6 +89,7 @@ class NuScenesSequenceDataset(Dataset):
 def collate_fn(batch):
     """Stack tensors; keep gt_boxes as a list (variable-length per sample)."""
     return {
+        'idx':             torch.stack([b['idx']             for b in batch]),
         'img_curr':        torch.stack([b['img_curr']        for b in batch]),  # [B,1,3,H,W]
         'cam2ego_curr':    torch.stack([b['cam2ego_curr']    for b in batch]),  # [B,1,4,4]
         'intrinsics_curr': torch.stack([b['intrinsics_curr'] for b in batch]),  # [B,1,3,3]
