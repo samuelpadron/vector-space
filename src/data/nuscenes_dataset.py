@@ -74,7 +74,7 @@ class NuScenesSequenceDataset(Dataset):
         gt_boxes = load_gt_boxes(self.nusc, token_curr)
 
         return {
-            'idx':             idx,
+            'idx':             torch.tensor(idx),
             'img_curr':        img_curr,    # [1, 3, H, W]
             'cam2ego_curr':    c2e_curr,    # [1, 4, 4]
             'intrinsics_curr': intr_curr,   # [1, 3, 3]

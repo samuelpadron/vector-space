@@ -14,10 +14,11 @@ import sys
 from pathlib import Path
 
 import torch
+import h5py
 from torch.utils.data import DataLoader
 from nuscenes.nuscenes import NuScenes
 
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from modules import FastBEV4D, load_checkpoint
 from data import NuScenesSequenceDataset, collate_fn
@@ -29,33 +30,52 @@ CACHE_DIR       = Path('./data/cache')
 BATCH_SIZE      = 16
 
 def build_cache(nusc, split, model, device):
-    dataset = NuScenesSequenceDataset(nusc, split=split)
-    loader  = DataLoader(
+    dataset  = NuScenesSequenceDataset(nusc, split=split)
+    out_path = CACHE_DIR / f'bev_prev_{split}.h5'
+
+    if out_path.exists():
+        print(f"  Cache already exists at {out_path}, skipping.")
+        return
+
+    loader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=False,
         collate_fn=collate_fn, num_workers=6,
         pin_memory=True,
     )
 
-    cache = {}
+    # peek at feature shape from first batch
     model.eval()
-
-    print(f"  Building {split} cache ({len(dataset)} samples)...")
     with torch.no_grad():
-        for batch in loader:
-            indices    = batch['idx']                           # list[int]
-            imgs_prev  = batch['img_prev'].to(device)          # [B, 1, 3, H, W]
-            c2e_prev   = batch['cam2ego_prev'].to(device)      # [B, 1, 4, 4]
-            intr_prev  = batch['intrinsics_prev'].to(device)   # [B, 1, 3, 3]
+        sample_batch = next(iter(loader))
+        sample_feat, _ = model.encode(
+            sample_batch['img_prev'].to(device),
+            sample_batch['cam2ego_prev'].to(device),
+            sample_batch['intrinsics_prev'].to(device),
+        )
+    feat_shape = sample_feat.shape[1:]  # (C, H, W)
 
-            feats, _ = model.encode(imgs_prev, c2e_prev, intr_prev)  # [B, C, H, W]
+    with h5py.File(out_path, 'w') as f:
+        dset = f.create_dataset(
+            'feats',
+            shape=(len(dataset), *feat_shape),
+            dtype='float32',
+            chunks=(1, *feat_shape),  # one chunk per sample, optimal for random access
+        )
 
-            for i, idx in enumerate(indices):
-                cache[int(idx)] = feats[i].cpu()   # store as float32 on CPU
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                indices   = batch['idx'].tolist()
+                imgs_prev = batch['img_prev'].to(device)
+                c2e_prev  = batch['cam2ego_prev'].to(device)
+                intr_prev = batch['intrinsics_prev'].to(device)
 
-    out_path = CACHE_DIR / f'bev_prev_{split}.pth'
-    torch.save(cache, out_path)
-    print(f"  Saved {len(cache)} entries -> {out_path}")
-    return out_path
+                feats, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
+
+                for i, idx in enumerate(indices):
+                    dset[idx] = feats[i].cpu().numpy()
+
+    print(f"  Saved -> {out_path}")
 
 
 def main():

@@ -8,3 +8,4 @@ pyquaternion
 ultralytics-opencv-headless
 scipy
 transformers
+h5py
