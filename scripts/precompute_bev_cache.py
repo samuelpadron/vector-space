@@ -1,0 +1,93 @@
+# precompute_bev_cache.py
+"""
+Precomputes frozen FastBEV encoder outputs for all prev-frame images
+and saves them to disk. To run once before training.
+
+Run from project root!
+
+Output:
+    ./data/cache/bev_prev_train.pth
+    ./data/cache/bev_prev_val.pth
+"""
+
+import sys
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from nuscenes.nuscenes import NuScenes
+
+sys.path.insert(0, str(Path(__file__).parent / 'src'))
+
+from modules import FastBEV4D, load_checkpoint
+from data import NuScenesSequenceDataset, collate_fn
+
+NUSCENES_ROOT   = Path('./data/nuscenes')
+NUSCENES_VER    = 'v1.0-trainval'
+CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
+CACHE_DIR       = Path('./data/cache')
+BATCH_SIZE      = 16
+
+def build_cache(nusc, split, model, device):
+    dataset = NuScenesSequenceDataset(nusc, split=split)
+    loader  = DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=False,
+        collate_fn=collate_fn, num_workers=6,
+        pin_memory=True,
+    )
+
+    cache = {}
+    model.eval()
+
+    print(f"  Building {split} cache ({len(dataset)} samples)...")
+    with torch.no_grad():
+        for batch in loader:
+            indices    = batch['idx']                           # list[int]
+            imgs_prev  = batch['img_prev'].to(device)          # [B, 1, 3, H, W]
+            c2e_prev   = batch['cam2ego_prev'].to(device)      # [B, 1, 4, 4]
+            intr_prev  = batch['intrinsics_prev'].to(device)   # [B, 1, 3, 3]
+
+            feats, _ = model.encode(imgs_prev, c2e_prev, intr_prev)  # [B, C, H, W]
+
+            for i, idx in enumerate(indices):
+                cache[int(idx)] = feats[i].cpu()   # store as float32 on CPU
+
+    out_path = CACHE_DIR / f'bev_prev_{split}.pth'
+    torch.save(cache, out_path)
+    print(f"  Saved {len(cache)} entries -> {out_path}")
+    return out_path
+
+
+def main():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    print("\nBuilding FastBEV4D...")
+    model = FastBEV4D(
+        in_channels=256,
+        bev_channels=64,
+        out_channels=256,
+        num_classes=10,
+        image_size=(256, 704),
+        feature_size=(16, 44),
+    )
+
+    if CHECKPOINT_PATH.exists():
+        model = load_checkpoint(model, CHECKPOINT_PATH, device)
+    else:
+        raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
+
+    model = model.to(device)
+
+    print("\nLoading nuScenes...")
+    nusc = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
+
+    for split in ('train', 'val'):
+        build_cache(nusc, split, model, device)
+
+    print("\nDone. Cache ready for training.")
+
+
+if __name__ == '__main__':
+    main()
