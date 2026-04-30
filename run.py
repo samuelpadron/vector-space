@@ -13,21 +13,23 @@ intrinsics  : [B, 1, 3, 3]
 
 import json
 import sys
+import h5py
 from pathlib import Path
 
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from nuscenes.nuscenes import NuScenes
 
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from modules import FastBEV4D, load_checkpoint, CenterPointLoss
-from data import NuScenesSequenceDataset, collate_fn
+from data import NuScenesSequenceDataset, collate_fn, BEVCache
 
 
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
+CACHE_ROOT      = Path('./data/cache')
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
@@ -60,6 +62,11 @@ def main():
 
     model = model.to(device)
     scaler = GradScaler()
+
+    bev_cache = {
+        'train': BEVCache(CACHE_ROOT / 'bev_prev_train.h5'),
+        'val':   BEVCache(CACHE_ROOT / 'bev_prev_val.h5'),
+    }
 
     for name, param in model.named_parameters():
         if name.startswith('temporal_fusion') or name.startswith('pts_bbox_head'):
@@ -102,7 +109,7 @@ def main():
 
     criterion = CenterPointLoss(num_classes=10)
 
-    def run_epoch(loader, train=True):
+    def run_epoch(loader, train=True, cache=None):
         if train:
             model.eval()                    # keep frozen encoder BN in eval mode
             model.temporal_fusion.train()
@@ -122,9 +129,14 @@ def main():
                 se2        = batch['se2'].to(device)            # [B, 3]
                 gt_boxes   = batch['gt_boxes']
 
-                with torch.no_grad():
-                    bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
-                bev_feat_prev = bev_feat_prev.detach()
+                if cache is not None:
+                    bev_feat_prev = torch.stack(
+                        [cache[int(i)] for i in batch['idx']]
+                    ).to(device)
+                else:
+                    with torch.no_grad():
+                        bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
+                    bev_feat_prev = bev_feat_prev.detach()
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -163,7 +175,7 @@ def main():
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
-        train_loss = run_epoch(loader, train=True)
+        train_loss = run_epoch(loader, train=True, cache=bev_cache['train'])
         scheduler.step()
         lr_fusion = optimizer.param_groups[0]['lr']
         print(f"  train loss: {train_loss:.4f}  lr={lr_fusion:.2e}")
@@ -171,7 +183,7 @@ def main():
         val_loss = None
         if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
             print(f"  Running validation ({len(val_set)} pairs)...")
-            val_loss = run_epoch(val_loader, train=False)
+            val_loss = run_epoch(val_loader, train=False, cache=bev_cache['val'])
             print(f"  val   loss: {val_loss:.4f}")
 
         ckpt = {
