@@ -58,8 +58,9 @@ def build_cache(nusc, split, model, device):
         dset = f.create_dataset(
             'feats',
             shape=(len(dataset), *feat_shape),
-            dtype='float32',
+            dtype='float16',
             chunks=(1, *feat_shape),  # one chunk per sample, optimal for random access
+            compression='lzf'
         )
 
         model.eval()

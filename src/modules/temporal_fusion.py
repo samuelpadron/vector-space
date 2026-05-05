@@ -80,8 +80,7 @@ class BEVWarp(nn.Module):
 class BEVTemporalFusionConcat(nn.Module):
     """
     Simple Option A: Concatenate current and warped previous features,
-    then squeeze with a 1×1 convolution.
-    Fast and easy to debug.
+    then squeeze with a 1x1 convolution.
     """
 
     def __init__(self, feat_channels: int = 256):
@@ -97,6 +96,16 @@ class BEVTemporalFusionConcat(nn.Module):
             kernel_size=1,
             padding=0,
         )
+        self._init_identity()
+        
+    def _init_identity(self):
+        with torch.no_grad():
+            nn.init.zeros_(self.fusion_conv.weight)
+            nn.init.zeros_(self.fusion_conv.bias)
+            C = self.fusion_conv.out_channels
+            # first C input channels are bev_feat_curr -> copy through as identity
+            for i in range(C):
+                self.fusion_conv.weight[i, i, 0, 0] = 1.0
 
     def forward(
         self,

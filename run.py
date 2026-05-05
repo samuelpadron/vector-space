@@ -13,7 +13,6 @@ intrinsics  : [B, 1, 3, 3]
 
 import json
 import sys
-import h5py
 from pathlib import Path
 
 import torch
@@ -24,12 +23,11 @@ from nuscenes.nuscenes import NuScenes
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from modules import FastBEV4D, load_checkpoint, CenterPointLoss
-from data import NuScenesSequenceDataset, collate_fn, BEVCache
+from data import NuScenesSequenceDataset, collate_fn
 
 
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
-CACHE_ROOT      = Path('./data/cache')
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
 SAVE_DIR        = Path('./checkpoints/fastbev4d')
 
@@ -63,27 +61,31 @@ def main():
     model = model.to(device)
     scaler = GradScaler()
 
-    bev_cache = {
-        'train': BEVCache(CACHE_ROOT / 'bev_prev_train.h5'),
-        'val':   BEVCache(CACHE_ROOT / 'bev_prev_val.h5'),
-    }
+    for param in model.parameters():
+        param.requires_grad = True
 
-    for name, param in model.named_parameters():
-        if name.startswith('temporal_fusion') or name.startswith('pts_bbox_head'):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
+    n_total      = sum(p.numel() for p in model.parameters())
+    n_fusion     = sum(p.numel() for p in model.temporal_fusion.parameters())
+    n_head       = sum(p.numel() for p in model.pts_bbox_head.parameters())
+    n_backbone   = sum(p.numel() for p in model.img_backbone.parameters())
+    n_neck       = sum(p.numel() for p in model.img_neck.parameters())
+    n_view_trans = sum(p.numel() for p in model.img_view_transformer.parameters())
+    n_bev_bb     = sum(p.numel() for p in model.img_bev_encoder_backbone.parameters())
+    n_bev_neck   = sum(p.numel() for p in model.img_bev_encoder_neck.parameters())
+    print(f"  Parameters: {n_total:,} total")
+    print(f"  (fusion={n_fusion:,}, head={n_head:,}, backbone={n_backbone:,})")
 
-    n_total     = sum(p.numel() for p in model.parameters())
-    n_fusion    = sum(p.numel() for p in model.temporal_fusion.parameters())
-    n_head      = sum(p.numel() for p in model.pts_bbox_head.parameters())
-    n_trainable = n_fusion + n_head
-    print(f"  Parameters: {n_total:,} total, {n_trainable:,} trainable "
-          f"(fusion={n_fusion:,}, head={n_head:,})")
+    LR_PRETRAINED = LR_FUSION * 0.01   # 1e-5, slow adaptation for pretrained components
+    LR_HEAD       = LR_FUSION * 0.1    # 1e-4, medium for head
 
     optimizer = torch.optim.AdamW([
-        {'params': model.temporal_fusion.parameters(), 'lr': LR_FUSION},
-        {'params': model.pts_bbox_head.parameters(),   'lr': LR_FUSION},
+        {'params': model.img_backbone.parameters(),             'lr': LR_PRETRAINED},
+        {'params': model.img_neck.parameters(),                 'lr': LR_PRETRAINED},
+        {'params': model.img_view_transformer.parameters(),     'lr': LR_PRETRAINED},
+        {'params': model.img_bev_encoder_backbone.parameters(), 'lr': LR_PRETRAINED},
+        {'params': model.img_bev_encoder_neck.parameters(),     'lr': LR_PRETRAINED},
+        {'params': model.temporal_fusion.parameters(),          'lr': LR_FUSION},
+        {'params': model.pts_bbox_head.parameters(),            'lr': LR_HEAD},
     ], weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -96,12 +98,12 @@ def main():
     val_set   = NuScenesSequenceDataset(nusc, split='val')
 
     loader = DataLoader(
-        train_set, batch_size=8, shuffle=True,
+        train_set, batch_size=16, shuffle=True,
         collate_fn=collate_fn, num_workers=6,
         pin_memory=True, persistent_workers=True
     )
     val_loader = DataLoader(
-        val_set, batch_size=8, shuffle=False,
+        val_set, batch_size=16, shuffle=False,
         collate_fn=collate_fn, num_workers=6,
         pin_memory=True, persistent_workers=True
     )
@@ -109,11 +111,9 @@ def main():
 
     criterion = CenterPointLoss(num_classes=10)
 
-    def run_epoch(loader, train=True, cache=None):
+    def run_epoch(loader, train=True):
         if train:
-            model.eval()                    # keep frozen encoder BN in eval mode
-            model.temporal_fusion.train()
-            model.pts_bbox_head.train()
+            model.train()
         else:
             model.eval()
 
@@ -129,18 +129,15 @@ def main():
                 se2        = batch['se2'].to(device)            # [B, 3]
                 gt_boxes   = batch['gt_boxes']
 
-                if cache is not None:
-                    bev_feat_prev = torch.stack(
-                        [cache[int(i)] for i in batch['idx']]
-                    ).to(device)
-                else:
-                    with torch.no_grad():
-                        bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
-                    bev_feat_prev = bev_feat_prev.detach()
+                with torch.no_grad():
+                    with autocast(device_type=device.type):
+                        img_feats_prev = model.extract_img_feat(imgs_prev)
+                        bev_feat_prev, _ = model.img_view_transformer(img_feats_prev, c2e_prev, intr_prev)
+                bev_feat_prev = bev_feat_prev.detach()
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with autocast():
+                with autocast(device_type=device.type):
                     outputs = model(
                         imgs_curr, c2e_curr, intr_curr,
                         bev_feat_prev=bev_feat_prev,
@@ -175,7 +172,7 @@ def main():
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
-        train_loss = run_epoch(loader, train=True, cache=bev_cache['train'])
+        train_loss = run_epoch(loader, train=True)
         scheduler.step()
         lr_fusion = optimizer.param_groups[0]['lr']
         print(f"  train loss: {train_loss:.4f}  lr={lr_fusion:.2e}")
@@ -183,7 +180,7 @@ def main():
         val_loss = None
         if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
             print(f"  Running validation ({len(val_set)} pairs)...")
-            val_loss = run_epoch(val_loader, train=False, cache=bev_cache['val'])
+            val_loss = run_epoch(val_loader, train=False)
             print(f"  val   loss: {val_loss:.4f}")
 
         ckpt = {

@@ -199,7 +199,7 @@ class FastrayTransformer(nn.Module):
 
                 bev_flat = bev_feat[b].view(-1, C)
                 bev_flat.scatter_add_(
-                    0, flat_idx.unsqueeze(-1).expand(-1, C), weighted_feat
+                    0, flat_idx.unsqueeze(-1).expand(-1, C), weighted_feat.to(bev_flat.dtype)
                 )
 
         bev_feat = bev_feat.sum(dim=3)           # collapse Z → [B, X, Y, C]
@@ -414,46 +414,34 @@ class FastBEV(nn.Module):
 
 
 class FastBEV4D(FastBEV):
-    """
-    FastBEV with BEVDet4D-style temporal fusion (concat + 1x1 conv).
-
-    First frame (no history):
-        out = model(imgs, cam2ego, intrinsics)
-
-    Subsequent frames:
-        out = model(imgs, cam2ego, intrinsics,
-                    bev_feat_prev=prev_out['bev_feat_enc'],
-                    se2=se2_tensor)   # [B, 3] — (dx, dy, dyaw) in grid units
-
-    Always pass bev_feat_enc (not bev_feat) as the prev cache so fused
-    features don't compound across frames.
-    """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.temporal_fusion = BEVTemporalFusionConcat(feat_channels=self.out_channels)
+        self.temporal_fusion = BEVTemporalFusionConcat(feat_channels=self.bev_channels)
 
-    def forward(
-        self,
-        imgs,                                        # [B, N, 3, H, W]  N=1 for monocam
-        cam2ego,                                     # [B, N, 4, 4]
-        cam_intrinsics,                              # [B, N, 3, 3]
-        img_aug_matrix=None,
-        bev_feat_prev: Optional[torch.Tensor] = None,  # [B, C, H_bev, W_bev]
-        se2: Optional[torch.Tensor] = None,             # [B, 3]
-    ):
-        bev_feat_enc, depth = self.encode(imgs, cam2ego, cam_intrinsics, img_aug_matrix)
+    def forward(self, imgs, cam2ego, cam_intrinsics, img_aug_matrix=None,
+                bev_feat_prev=None, se2=None):
 
+        # 1. image -> view transformer (sparse BEV features)
+        img_feats = self.extract_img_feat(imgs)
+        bev_feat_sparse, depth = self.img_view_transformer(
+            img_feats, cam2ego, cam_intrinsics, img_aug_matrix
+        )
+
+        # 2. temporal fusion on raw sparse features
         if bev_feat_prev is not None and se2 is not None:
-            bev_feat = self.temporal_fusion(bev_feat_enc, bev_feat_prev, se2)
+            bev_feat_fused = self.temporal_fusion(bev_feat_sparse, bev_feat_prev, se2)
         else:
-            bev_feat = bev_feat_enc
+            bev_feat_fused = bev_feat_sparse
 
-        preds = self.pts_bbox_head(bev_feat)
+        # 3. pretrained main BEV encoder + head
+        bev_feats = self.img_bev_encoder_backbone(bev_feat_fused)
+        bev_feat_enc = self.img_bev_encoder_neck(bev_feats)
+        preds = self.pts_bbox_head(bev_feat_enc)
+
         return {
             'predictions':  preds,
-            'bev_feat':     bev_feat,      # post-fusion — fed to head
-            'bev_feat_enc': bev_feat_enc,  # pre-fusion  — cache as prev next frame
+            'bev_feat':     bev_feat_enc,
+            'bev_feat_enc': bev_feat_sparse,  # cache raw sparse features as prev
             'depth':        depth,
         }
 
