@@ -83,13 +83,14 @@ class BEVTemporalFusionConcat(nn.Module):
     then squeeze with a 1x1 convolution.
     """
 
-    def __init__(self, feat_channels: int = 256):
+    def __init__(self, feat_channels: int = 256, dropout: float = 0.1):
         """
         Args:
             feat_channels: Number of channels in BEV feature maps.
         """
         super().__init__()
         self.warp = BEVWarp()
+        self.dropout = nn.Dropout2d(p=dropout)
         self.fusion_conv = nn.Conv2d(
             feat_channels * 2,
             feat_channels,
@@ -129,6 +130,8 @@ class BEVTemporalFusionConcat(nn.Module):
 
         # Concatenate along channel dimension
         concatenated = torch.cat([bev_feat_curr, warped_prev], dim=1)  # [B, 2C, H, W]
+        
+        concatenated = self.dropout(concatenated)
 
         # Squeeze back to original channel count
         fused = self.fusion_conv(concatenated)  # [B, C, H, W]

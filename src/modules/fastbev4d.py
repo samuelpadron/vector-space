@@ -416,7 +416,7 @@ class FastBEV(nn.Module):
 class FastBEV4D(FastBEV):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.temporal_fusion = BEVTemporalFusionConcat(feat_channels=self.bev_channels)
+        self.temporal_fusion = BEVTemporalFusionConcat(feat_channels=self.bev_channels, dropout=0.3)
 
     def forward(self, imgs, cam2ego, cam_intrinsics, img_aug_matrix=None,
                 bev_feat_prev=None, se2=None):

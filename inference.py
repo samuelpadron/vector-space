@@ -495,7 +495,7 @@ def visualize_cameras(images, save_path=None):
 def main():
     # Paths
     nuscenes_root = Path('./data/nuscenes')
-    checkpoint_path = Path('./checkpoints/fastbev4d/best.pth')
+    checkpoint_path = Path('./checkpoints/fastbev4d_warmup/best.pth')
     output_dir = Path('./viz_output/fastbev4d')
     output_dir.mkdir(parents=True, exist_ok=True)
 

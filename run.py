@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from nuscenes.nuscenes import NuScenes
 
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
@@ -29,13 +30,16 @@ from data import NuScenesSequenceDataset, collate_fn
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
-SAVE_DIR        = Path('./checkpoints/fastbev4d')
+SAVE_DIR        = Path('./checkpoints/fastbev4d_warmup')
 
 NUM_EPOCHS  = 40
-LR_FUSION   = 1e-3
+LR_FUSION   = 1e-4
+LR_PRETRAINED = LR_FUSION * 0.01   # 1e-6, slow adaptation for pretrained components
+LR_HEAD       = LR_FUSION * 0.1    # 1e-5, medium for head
 GRAD_CLIP   = 5.0
 LOG_EVERY   = 10
-VAL_EVERY   = 5
+VAL_EVERY   = 1
+PATIENCE    = 5 # for validation
 
 
 def main():
@@ -75,22 +79,19 @@ def main():
     print(f"  Parameters: {n_total:,} total")
     print(f"  (fusion={n_fusion:,}, head={n_head:,}, backbone={n_backbone:,})")
 
-    LR_PRETRAINED = LR_FUSION * 0.01   # 1e-5, slow adaptation for pretrained components
-    LR_HEAD       = LR_FUSION * 0.1    # 1e-4, medium for head
-
     optimizer = torch.optim.AdamW([
-        {'params': model.img_backbone.parameters(),             'lr': LR_PRETRAINED},
-        {'params': model.img_neck.parameters(),                 'lr': LR_PRETRAINED},
-        {'params': model.img_view_transformer.parameters(),     'lr': LR_PRETRAINED},
-        {'params': model.img_bev_encoder_backbone.parameters(), 'lr': LR_PRETRAINED},
-        {'params': model.img_bev_encoder_neck.parameters(),     'lr': LR_PRETRAINED},
-        {'params': model.temporal_fusion.parameters(),          'lr': LR_FUSION},
-        {'params': model.pts_bbox_head.parameters(),            'lr': LR_HEAD},
-    ], weight_decay=1e-4)
+        {'params': model.img_backbone.parameters(),             'lr': LR_PRETRAINED, 'weight_decay': 1e-4},
+        {'params': model.img_neck.parameters(),                 'lr': LR_PRETRAINED, 'weight_decay': 1e-4},
+        {'params': model.img_view_transformer.parameters(),     'lr': LR_PRETRAINED, 'weight_decay': 1e-4},
+        {'params': model.img_bev_encoder_backbone.parameters(), 'lr': LR_PRETRAINED, 'weight_decay': 1e-4},
+        {'params': model.img_bev_encoder_neck.parameters(),     'lr': LR_PRETRAINED, 'weight_decay': 1e-4},
+        {'params': model.temporal_fusion.parameters(),          'lr': LR_FUSION,     'weight_decay': 1e-2},
+        {'params': model.pts_bbox_head.parameters(),            'lr': LR_HEAD,       'weight_decay': 1e-4},
+    ])
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=40, eta_min=1e-5
-    )
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=5)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=35, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
 
     print("\nLoading nuScenes...")
     nusc      = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
@@ -167,22 +168,19 @@ def main():
         return total_loss / len(loader)
 
     print("\nStarting training...\n")
-    best_loss = float('inf')
+    best_val_loss    = float('inf')
+    patience_counter = 0
     history   = []
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
         train_loss = run_epoch(loader, train=True)
         scheduler.step()
-        lr_fusion = optimizer.param_groups[0]['lr']
+        lr_fusion = optimizer.param_groups[5]['lr'] # log temp fusion component
         print(f"  train loss: {train_loss:.4f}  lr={lr_fusion:.2e}")
-
+        
         val_loss = None
-        if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
-            print(f"  Running validation ({len(val_set)} pairs)...")
-            val_loss = run_epoch(val_loader, train=False)
-            print(f"  val   loss: {val_loss:.4f}")
-
+        
         ckpt = {
             'epoch':      epoch,
             'model':      model.state_dict(),
@@ -190,14 +188,27 @@ def main():
             'scheduler':  scheduler.state_dict(),
             'train_loss': train_loss,
             'val_loss':   val_loss,
-        }
-        torch.save(ckpt, SAVE_DIR / 'last.pth')
+        }   
+        
+        if epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS - 1:
+            print(f"  Running validation ({len(val_set)} pairs)...")
+            val_loss = run_epoch(val_loader, train=False)
+            ckpt['val_loss'] = val_loss
+            print(f"  val   loss: {val_loss:.4f}")
+            if val_loss is not None:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    torch.save(ckpt, SAVE_DIR / 'best.pth')
+                    print(f"  -> new best (val_loss={best_val_loss:.4f}), saved best.pth")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= PATIENCE:
+                        torch.save(ckpt, SAVE_DIR / 'last.pth')
+                        print(f"Early stopping at epoch {epoch}")
+                        break     
 
-        monitor = val_loss if val_loss is not None else train_loss
-        if monitor < best_loss:
-            best_loss = monitor
-            torch.save(ckpt, SAVE_DIR / 'best.pth')
-            print(f"  -> new best (loss={best_loss:.4f}), saved best.pth")
+        torch.save(ckpt, SAVE_DIR / 'last.pth')
 
         history.append({
             'epoch':      epoch,
@@ -209,7 +220,7 @@ def main():
             json.dump(history, f, indent=2)
         print()
 
-    print(f"Training complete. Best loss: {best_loss:.4f}")
+    print(f"Training complete. Best loss: {best_val_loss:.4f}")
 
 
 if __name__ == '__main__':
