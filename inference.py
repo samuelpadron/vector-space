@@ -12,6 +12,8 @@ from pathlib import Path
 import sys
 from typing import Tuple, List, Dict
 
+from data.nuscenes_dataset import _compute_se2
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from torchvision.models import resnet50
@@ -22,7 +24,7 @@ from matplotlib.patches import Rectangle
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
-from src.modules import FastBEV4D
+from src.modules import FastBEV4D, FastBEV
 
 
 def load_checkpoint(model, checkpoint_path, device='cuda'):
@@ -492,6 +494,149 @@ def visualize_cameras(images, save_path=None):
         print(f"  Saved camera visualization to {save_path}")
     plt.close()
 
+def visualize_comparison(
+    image_curr,
+    image_prev,
+    out_baseline,
+    out_4d,
+    save_path=None,
+):
+    """
+    6-panel comparison figure.
+
+    Row 0: [CAM_FRONT curr] [baseline detections] [baseline heatmap]
+    Row 1: [CAM_FRONT t-1]  [FastBEV4D detections] [FastBEV4D heatmap]
+    """
+    class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+                   'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+    class_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+
+    VOXEL_SIZE  = 0.8
+    GRID_CENTER = 64
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    # --- helpers ---
+    def add_rings(ax):
+        for dist in [10, 20, 30, 40, 50]:
+            r = dist / VOXEL_SIZE
+            ax.add_patch(plt.Circle(
+                (GRID_CENTER, GRID_CENTER), r,
+                fill=False, color='white', linestyle='--', alpha=0.4, linewidth=0.8
+            ))
+            ax.text(GRID_CENTER + r + 1, GRID_CENTER, f'{dist}m',
+                color='white', fontsize=7, alpha=0.6, va='center')
+
+    def add_ego(ax):
+        ax.add_patch(plt.Circle(
+            (GRID_CENTER, GRID_CENTER), 3,
+            color='cyan', fill=True, zorder=10
+        ))
+        ax.arrow(
+            GRID_CENTER, GRID_CENTER, 0, 8,
+            head_width=2, head_length=1.5,
+            fc='cyan', ec='white', linewidth=1, zorder=11
+        )
+
+    def add_directions(ax):
+        for txt, x, y, ha, va in [
+            ('FRONT', GRID_CENTER,      GRID_CENTER + 58, 'center', 'bottom'),
+            ('BACK',  GRID_CENTER,      GRID_CENTER - 58, 'center', 'top'),
+            ('LEFT',  GRID_CENTER - 58, GRID_CENTER,      'right',  'center'),
+            ('RIGHT', GRID_CENTER + 58, GRID_CENTER,      'left',   'center'),
+        ]:
+            ax.text(x, y, txt,
+                color='lime' if txt == 'FRONT' else 'white',
+                fontsize=8, ha=ha, va=va, alpha=0.8, fontweight='bold')
+
+    def setup_bev_ax(ax, title):
+        ax.set_xlim(0, 128)
+        ax.set_ylim(0, 128)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel('← Left | Right →', fontsize=8)
+        ax.set_ylabel('← Back | Front →', fontsize=8)
+
+    def draw_detections(ax, preds):
+        detections = decode_predictions(preds, score_threshold=0.2)
+        for det in detections:
+            px = (-det['y'] + 51.2) / VOXEL_SIZE
+            py = ( det['x'] + 51.2) / VOXEL_SIZE
+            w_px = det['w'] / VOXEL_SIZE
+            l_px = det['l'] / VOXEL_SIZE
+            color = class_colors[det['class']]
+            rotated_yaw = det['yaw'] + np.pi / 2
+            cos_y = np.cos(rotated_yaw)
+            sin_y = np.sin(rotated_yaw)
+            corners = np.array([
+                [-w_px/2,  l_px/2],
+                [ w_px/2,  l_px/2],
+                [ w_px/2, -l_px/2],
+                [-w_px/2, -l_px/2],
+                [-w_px/2,  l_px/2],
+            ])
+            rot = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
+            corners = corners @ rot.T
+            corners[:, 0] += px
+            corners[:, 1] += py
+            ax.plot(corners[:, 0], corners[:, 1], color=color, linewidth=1.5)
+            dist = np.sqrt(det['x']**2 + det['y']**2)
+            ax.text(px, py + 4, class_names[det['class']][:3],
+                fontsize=6, ha='center', va='bottom', color='white', fontweight='bold')
+            ax.text(px, py - 4, f'{dist:.0f}m',
+                fontsize=6, ha='center', va='top', color='yellow')
+        return len(detections)
+
+    def show_camera(ax, img_tensor, title):
+        if img_tensor is not None:
+            img = img_tensor.cpu() * std + mean
+            img = img.permute(1, 2, 0).numpy()
+            img = np.clip(img, 0, 1)
+            ax.imshow(img)
+        else:
+            ax.set_facecolor('black')
+            ax.text(0.5, 0.5, 'no frame available',
+                ha='center', va='center',
+                transform=ax.transAxes, color='white', fontsize=10)
+        ax.set_title(title, fontsize=10)
+        ax.axis('off')
+
+    def show_heatmap(ax, preds, title):
+        hm = preds[0]['heatmap'][0].sigmoid().max(dim=0)[0]
+        hm = np.rot90(hm.detach().cpu().numpy(), k=3)
+        ax.imshow(hm, cmap='hot', origin='lower')
+        add_rings(ax)
+        add_ego(ax)
+        setup_bev_ax(ax, title)
+
+    def show_detections(ax, preds, title):
+        ax.imshow(np.zeros((128, 128, 3)) + 0.1, origin='lower')
+        add_rings(ax)
+        add_directions(ax)
+        add_ego(ax)
+        n = draw_detections(ax, preds)
+        setup_bev_ax(ax, f'{title} ({n})')
+
+    # --- ROW 0: baseline ---
+    show_camera(axes[0, 0], image_curr, 'CAM_FRONT (t)')
+    show_detections(axes[0, 1], out_baseline['predictions'], 'Baseline detections')
+    show_heatmap(axes[0, 2], out_baseline['predictions'], 'Baseline heatmap')
+
+    # --- ROW 1: FastBEV4D ---
+    show_camera(axes[1, 0], image_prev, 'CAM_FRONT (t-1)')
+    show_detections(axes[1, 1], out_4d['predictions'], 'FastBEV4D detections')
+    show_heatmap(axes[1, 2], out_4d['predictions'], 'FastBEV4D heatmap')
+
+    plt.suptitle('FastBEV baseline vs FastBEV4D (with temporal fusion)', fontsize=13)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved comparison to {save_path}")
+    plt.close()
+    
 def main():
     # Paths
     nuscenes_root = Path('./data/nuscenes')
@@ -506,7 +651,16 @@ def main():
 
     # Create model
     print("\nCreating FastBEV4D model...")
-    model = FastBEV4D(
+    model_4d = FastBEV4D(
+        in_channels=256,
+        bev_channels=64,
+        out_channels=256,
+        num_classes=10,
+        image_size=(256, 704),
+        feature_size=(16, 44),
+    )
+    
+    model_baseline = FastBEV(
         in_channels=256,
         bev_channels=64,
         out_channels=256,
@@ -517,16 +671,20 @@ def main():
 
     # Load pretrained weights
     if checkpoint_path.exists():
-        model = load_checkpoint(model, checkpoint_path, device)
+        model_4d = load_checkpoint(model_4d, checkpoint_path, device)
+        model_baseline = load_checkpoint(model_baseline, checkpoint_path, device)
     else:
         print(f"Warning: Checkpoint not found at {checkpoint_path}")
         print("Running with random weights...")
 
-    model = model.to(device)
-    model.eval()
+    model_4d = model_4d.to(device)
+    model_baseline = model_baseline.to(device)
+    
+    model_4d.eval()
+    model_baseline.eval()
 
     # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = sum(p.numel() for p in model_4d.parameters())
     print(f"Total parameters: {total_params:,}")
 
     # Load nuScenes
@@ -537,6 +695,7 @@ def main():
     for sample_idx in range(min(3, len(nusc.sample))):
         sample = nusc.sample[sample_idx]
         sample_token = sample['token']
+        prev_token = nusc.get('sample', sample_token)['prev']
         print(f"\nProcessing sample {sample_idx}: {sample_token[:8]}...")
 
         # Load data
@@ -546,8 +705,6 @@ def main():
         cam_name = 'CAM_FRONT'
         cam_token = sample_data['data'][cam_name]
         cam_data = nusc.get('sample_data', cam_token)
-        img_path = Path(nusc.dataroot) / cam_data['filename']
-        img_pil = Image.open(img_path).convert('RGB')
 
         # Add batch dimension and move to device
         images = images.unsqueeze(0).to(device)
@@ -560,19 +717,47 @@ def main():
         # Run inference
         print("  Running inference...")
         with torch.no_grad():
-            outputs = model(images, cam2egos, intrinsics, img_aug_matrices)
+            outputs_baseline = model_baseline(images, cam2egos, intrinsics, img_aug_matrices)
+            
+            if prev_token:
+                # load prev frame
+                imgs_prev, intr_prev, c2e_prev, _, _ = load_sample(nusc, prev_token)
+                imgs_prev  = imgs_prev.unsqueeze(0).to(device)
+                intr_prev  = intr_prev.unsqueeze(0).to(device)
+                c2e_prev   = c2e_prev.unsqueeze(0).to(device)
 
-        print(f"  BEV features shape: {outputs['bev_feat'].shape}")
-        print(f"  Heatmap shape: {outputs['predictions'][0]['heatmap'].shape}")
+                # get sparse BEV for prev frame
+                img_feats_prev = model_4d.extract_img_feat(imgs_prev)
+                bev_feat_prev, _ = model_4d.img_view_transformer(
+                    img_feats_prev, c2e_prev, intr_prev
+                )
+
+                # compute SE2 between prev and curr ego poses
+                ego_curr = nusc.get('ego_pose',
+                    nusc.get('sample_data', sample_data['data']['CAM_FRONT'])['ego_pose_token'])
+                ego_prev = nusc.get('ego_pose',
+                    nusc.get('sample_data',
+                        nusc.get('sample', prev_token)['data']['CAM_FRONT'])['ego_pose_token'])
+                se2 = _compute_se2(ego_prev, ego_curr).unsqueeze(0).to(device)
+
+                # FastBEV4D with prev frame
+                outputs_4d = model_4d(
+                    images, cam2egos, intrinsics,
+                    bev_feat_prev=bev_feat_prev,
+                    se2=se2,
+                )
+
+        print(f"  BEV features shape: {outputs_4d['bev_feat'].shape}")
+        print(f"  Heatmap shape: {outputs_4d['predictions'][0]['heatmap'].shape}")
 
         # Visualize outputs with input images
-        visualize_bev_with_detections(
-            outputs['bev_feat'],
-            outputs['predictions'],
-            save_path=output_dir / f'detections_{sample_idx}.png',
-            input_images=images[0, 0],  # Pass single image (C, H, W) for mono camera
+        visualize_comparison(
+            image_curr=images[0, 0],
+            image_prev=imgs_prev[0, 0] if prev_token else None,
+            out_baseline=out_baseline,
+            out_4d=out_4d,
+            save_path=output_dir / f'comparison_{sample_idx}.png',
         )
-
     print(f"\nDone! Outputs saved to {output_dir}")
 
 

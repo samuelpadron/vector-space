@@ -30,7 +30,7 @@ from data import NuScenesSequenceDataset, collate_fn
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
-SAVE_DIR        = Path('./checkpoints/fastbev4d_warmup')
+SAVE_DIR        = Path('./checkpoints/fastbev4d_fusion')
 
 NUM_EPOCHS  = 40
 LR_FUSION   = 1e-4
@@ -134,6 +134,7 @@ def main():
                     with autocast(device_type=device.type):
                         img_feats_prev = model.extract_img_feat(imgs_prev)
                         bev_feat_prev, _ = model.img_view_transformer(img_feats_prev, c2e_prev, intr_prev)
+                        bev_feat_prev = model.img_bev_encoder_backbone(bev_feat_prev)
                 bev_feat_prev = bev_feat_prev.detach()
 
                 optimizer.zero_grad(set_to_none=True)

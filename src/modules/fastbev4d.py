@@ -427,15 +427,16 @@ class FastBEV4D(FastBEV):
             img_feats, cam2ego, cam_intrinsics, img_aug_matrix
         )
 
+        # 3. pretrained main BEV encoder + head
+        bev_feats = self.img_bev_encoder_backbone(bev_feat_sparse)
+
         # 2. temporal fusion on raw sparse features
         if bev_feat_prev is not None and se2 is not None:
-            bev_feat_fused = self.temporal_fusion(bev_feat_sparse, bev_feat_prev, se2)
+            bev_feat_fused = self.temporal_fusion(bev_feats, bev_feat_prev, se2)
         else:
             bev_feat_fused = bev_feat_sparse
 
-        # 3. pretrained main BEV encoder + head
-        bev_feats = self.img_bev_encoder_backbone(bev_feat_fused)
-        bev_feat_enc = self.img_bev_encoder_neck(bev_feats)
+        bev_feat_enc = self.img_bev_encoder_neck(bev_feat_fused)
         preds = self.pts_bbox_head(bev_feat_enc)
 
         return {
