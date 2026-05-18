@@ -40,6 +40,7 @@ GRAD_CLIP   = 5.0
 LOG_EVERY   = 10
 VAL_EVERY   = 1
 PATIENCE    = 5 # for validation
+RESUME_CKPT = SAVE_DIR / 'last.pth'  # set to None to train from scratch
 
 
 def main():
@@ -93,6 +94,29 @@ def main():
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=35, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
 
+    # Resume training if checkpoint exists, otherwise start fresh
+    start_epoch      = 0
+    best_val_loss    = float('inf')
+    patience_counter = 0
+    history          = []
+
+    if RESUME_CKPT is not None and RESUME_CKPT.exists():
+        print(f"\nResuming from {RESUME_CKPT}")
+        resume = torch.load(RESUME_CKPT, map_location=device, weights_only=False)
+        model.load_state_dict(resume['model'])
+        optimizer.load_state_dict(resume['optimizer'])
+        scheduler.load_state_dict(resume['scheduler'])
+        start_epoch = resume['epoch'] + 1
+        best_path = SAVE_DIR / 'best.pth'
+        if best_path.exists():
+            best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            best_val_loss = best_ckpt.get('val_loss') or float('inf')
+        log_path = SAVE_DIR / 'log.json'
+        if log_path.exists():
+            with open(log_path) as f:
+                history = json.load(f)
+        print(f"  start_epoch={start_epoch}  best_val={best_val_loss:.4f}  history={len(history)} entries")
+
     print("\nLoading nuScenes...")
     nusc      = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
     train_set = NuScenesSequenceDataset(nusc, split='train')
@@ -132,10 +156,7 @@ def main():
 
                 with torch.no_grad():
                     with autocast(device_type=device.type):
-                        img_feats_prev = model.extract_img_feat(imgs_prev)
-                        bev_feat_prev, _ = model.img_view_transformer(img_feats_prev, c2e_prev, intr_prev)
-                        bev_feat_prev = model.img_bev_encoder_backbone(bev_feat_prev)
-                bev_feat_prev = bev_feat_prev.detach()
+                        bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -169,11 +190,8 @@ def main():
         return total_loss / len(loader)
 
     print("\nStarting training...\n")
-    best_val_loss    = float('inf')
-    patience_counter = 0
-    history   = []
 
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         print(f"Epoch {epoch:02d}/{NUM_EPOCHS - 1}")
         train_loss = run_epoch(loader, train=True)
         scheduler.step()

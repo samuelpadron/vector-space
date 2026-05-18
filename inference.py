@@ -12,10 +12,9 @@ from pathlib import Path
 import sys
 from typing import Tuple, List, Dict
 
+sys.path.insert(0, str(Path(__file__).parent / 'src'))
+
 from data.nuscenes_dataset import _compute_se2
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from torchvision.models import resnet50
 from torchvision.transforms.functional import normalize
 from PIL import Image
@@ -24,7 +23,7 @@ from matplotlib.patches import Rectangle
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
-from src.modules import FastBEV4D, FastBEV
+from modules import FastBEV4D, FastBEV
 
 
 def load_checkpoint(model, checkpoint_path, device='cuda'):
@@ -640,7 +639,7 @@ def visualize_comparison(
 def main():
     # Paths
     nuscenes_root = Path('./data/nuscenes')
-    checkpoint_path = Path('./checkpoints/fastbev4d_warmup/best.pth')
+    checkpoint_path = Path('./checkpoints/fastbev4d_fusion/best.pth')
     output_dir = Path('./viz_output/fastbev4d')
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -726,11 +725,7 @@ def main():
                 intr_prev  = intr_prev.unsqueeze(0).to(device)
                 c2e_prev   = c2e_prev.unsqueeze(0).to(device)
 
-                # get sparse BEV for prev frame
-                img_feats_prev = model_4d.extract_img_feat(imgs_prev)
-                bev_feat_prev, _ = model_4d.img_view_transformer(
-                    img_feats_prev, c2e_prev, intr_prev
-                )
+                bev_feat_prev, _ = model_4d.encode(imgs_prev, c2e_prev, intr_prev)
 
                 # compute SE2 between prev and curr ego poses
                 ego_curr = nusc.get('ego_pose',
@@ -747,17 +742,18 @@ def main():
                     se2=se2,
                 )
 
-        print(f"  BEV features shape: {outputs_4d['bev_feat'].shape}")
-        print(f"  Heatmap shape: {outputs_4d['predictions'][0]['heatmap'].shape}")
+        if prev_token:
+            print(f"  BEV features shape: {outputs_4d['bev_feat'].shape}")
+            print(f"  Heatmap shape: {outputs_4d['predictions'][0]['heatmap'].shape}")
 
-        # Visualize outputs with input images
-        visualize_comparison(
-            image_curr=images[0, 0],
-            image_prev=imgs_prev[0, 0] if prev_token else None,
-            out_baseline=out_baseline,
-            out_4d=out_4d,
-            save_path=output_dir / f'comparison_{sample_idx}.png',
-        )
+            # Visualize outputs with input images
+            visualize_comparison(
+                image_curr=images[0, 0],
+                image_prev=imgs_prev[0, 0],
+                out_baseline=outputs_baseline,
+                out_4d=outputs_4d,
+                save_path=output_dir / f'comparison_{sample_idx}.png',
+            )
     print(f"\nDone! Outputs saved to {output_dir}")
 
 

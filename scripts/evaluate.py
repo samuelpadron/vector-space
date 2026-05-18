@@ -31,7 +31,7 @@ from data import load_sample
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
 NUSCENES_SPLIT  = 'val'             # eval on held-out val set
-CHECKPOINT_PATH = Path('./checkpoints/fastbev4d/epoch_19.pth')  # trained model
+CHECKPOINT_PATH = Path('./checkpoints/fastbev4d_fusion/best.pth')  # trained model
 EVAL_OUTPUT_DIR = Path('./eval_output')
 SCORE_THRESHOLD = 0.05
 MAX_DETS        = 500
@@ -216,11 +216,12 @@ def main():
             done += 1
             print(f"  [{done:3d}/{total}]", end='\r')
 
-            # load_sample already returns [1, 3, H, W] / [1, 4, 4] / [1, 3, 3]
+            # load_sample returns [N, 3, H, W] / [N, 4, 4] / [N, 3, 3] (N=1, monocam)
+            # unsqueeze(0) adds the batch dim → [B, N, ...]
             img, intr, c2e, _, ego_pose, _ = load_sample(nusc, token)
-            img  = img.to(device)
-            intr = intr.to(device)
-            c2e  = c2e.to(device)
+            img  = img.unsqueeze(0).to(device)   # [1, 1, 3, H, W]
+            intr = intr.unsqueeze(0).to(device)  # [1, 1, 3, 3]
+            c2e  = c2e.unsqueeze(0).to(device)   # [1, 1, 4, 4]
 
             # SE(2) from previous frame (None on scene-first frame)
             se2 = None
