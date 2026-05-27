@@ -497,14 +497,18 @@ def visualize_comparison(
     image_curr,
     image_prev,
     out_baseline,
+    out_baseline_prev,
     out_4d,
+    out_prev,
     save_path=None,
 ):
     """
-    6-panel comparison figure.
+    12-panel comparison figure (4 rows × 3 cols).
 
-    Row 0: [CAM_FRONT curr] [baseline detections] [baseline heatmap]
-    Row 1: [CAM_FRONT t-1]  [FastBEV4D detections] [FastBEV4D heatmap]
+    Row 0: [CAM_FRONT (t)]   [Baseline dets (t)]     [Baseline heatmap (t)]
+    Row 1: [CAM_FRONT (t)]   [4D dets (t, fused)]    [4D heatmap (t, fused)]
+    Row 2: [CAM_FRONT (t-1)] [Baseline dets (t-1)]   [Baseline heatmap (t-1)]
+    Row 3: [CAM_FRONT (t-1)] [4D dets (t-1, single)] [4D heatmap (t-1, single)]
     """
     class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
@@ -516,7 +520,7 @@ def visualize_comparison(
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(4, 3, figsize=(18, 22))
 
     # --- helpers ---
     def add_rings(ax):
@@ -618,17 +622,27 @@ def visualize_comparison(
         n = draw_detections(ax, preds)
         setup_bev_ax(ax, f'{title} ({n})')
 
-    # --- ROW 0: baseline ---
-    show_camera(axes[0, 0], image_curr, 'CAM_FRONT (t)')
-    show_detections(axes[0, 1], out_baseline['predictions'], 'Baseline detections')
-    show_heatmap(axes[0, 2], out_baseline['predictions'], 'Baseline heatmap')
+    # --- ROW 0: Baseline at t ---
+    show_camera(axes[0, 0],     image_curr, 'CAM_FRONT (t)')
+    show_detections(axes[0, 1], out_baseline['predictions'], 'Baseline dets (t)')
+    show_heatmap(axes[0, 2],    out_baseline['predictions'], 'Baseline heatmap (t)')
 
-    # --- ROW 1: FastBEV4D ---
-    show_camera(axes[1, 0], image_prev, 'CAM_FRONT (t-1)')
-    show_detections(axes[1, 1], out_4d['predictions'], 'FastBEV4D detections')
-    show_heatmap(axes[1, 2], out_4d['predictions'], 'FastBEV4D heatmap')
+    # --- ROW 1: FastBEV4D at t (with temporal fusion) ---
+    show_camera(axes[1, 0],     image_curr, 'CAM_FRONT (t)')
+    show_detections(axes[1, 1], out_4d['predictions'], 'FastBEV4D dets (t, fused)')
+    show_heatmap(axes[1, 2],    out_4d['predictions'], 'FastBEV4D heatmap (t, fused)')
 
-    plt.suptitle('FastBEV baseline vs FastBEV4D (with temporal fusion)', fontsize=13)
+    # --- ROW 2: Baseline at t-1 ---
+    show_camera(axes[2, 0],     image_prev, 'CAM_FRONT (t-1)')
+    show_detections(axes[2, 1], out_baseline_prev['predictions'], 'Baseline dets (t-1)')
+    show_heatmap(axes[2, 2],    out_baseline_prev['predictions'], 'Baseline heatmap (t-1)')
+
+    # --- ROW 3: FastBEV4D at t-1 (single-frame) ---
+    show_camera(axes[3, 0],     image_prev, 'CAM_FRONT (t-1)')
+    show_detections(axes[3, 1], out_prev['predictions'], 'FastBEV4D dets (t-1, single)')
+    show_heatmap(axes[3, 2],    out_prev['predictions'], 'FastBEV4D heatmap (t-1, single)')
+
+    plt.suptitle('FastBEV baseline vs FastBEV4D — t and t-1', fontsize=13)
     plt.tight_layout()
 
     if save_path:
@@ -742,16 +756,18 @@ def main():
                     se2=se2,
                 )
 
-        if prev_token:
-            print(f"  BEV features shape: {outputs_4d['bev_feat'].shape}")
-            print(f"  Heatmap shape: {outputs_4d['predictions'][0]['heatmap'].shape}")
+                # Single-frame inference on prev frame for both models
+                outputs_baseline_prev = model_baseline(imgs_prev, c2e_prev, intr_prev)
+                outputs_prev          = model_4d(imgs_prev, c2e_prev, intr_prev)
 
-            # Visualize outputs with input images
+        if prev_token:
             visualize_comparison(
                 image_curr=images[0, 0],
                 image_prev=imgs_prev[0, 0],
                 out_baseline=outputs_baseline,
+                out_baseline_prev=outputs_baseline_prev,
                 out_4d=outputs_4d,
+                out_prev=outputs_prev,
                 save_path=output_dir / f'comparison_{sample_idx}.png',
             )
     print(f"\nDone! Outputs saved to {output_dir}")
