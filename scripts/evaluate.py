@@ -8,10 +8,11 @@ Usage:
     python scripts/evaluate.py [--checkpoint PATH]
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -30,11 +31,31 @@ from data import load_sample
 
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
-NUSCENES_SPLIT  = 'val'             # eval on held-out val set
-CHECKPOINT_PATH = Path('./checkpoints/fastbev4d_fusion/best.pth')  # trained model
-EVAL_OUTPUT_DIR = Path('./eval_output')
+NUSCENES_SPLIT  = 'val'
 SCORE_THRESHOLD = 0.05
 MAX_DETS        = 500
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='FastBEV4D evaluation')
+    parser.add_argument(
+        '--prev-frames', type=int, default=1,
+        metavar='N',
+        help='Number of past frames fused during training (must match). Default: 1.',
+    )
+    parser.add_argument(
+        '--checkpoint', type=Path, default=None,
+        help='Path to checkpoint. Defaults to checkpoints/fastbev4d_prev<N>/best.pth.',
+    )
+    parser.add_argument(
+        '--output-dir', type=Path, default=None,
+        help='Evaluation output directory. Defaults to eval_output_prev<N>.',
+    )
+    parser.add_argument(
+        '--reeval', action='store_true',
+        help='Skip inference; evaluate existing submission.json in --output-dir.',
+    )
+    return parser.parse_args()
 
 CLASS_NAMES = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
@@ -161,36 +182,18 @@ def compute_se2(ego_prev: dict, ego_curr: dict, grid_res: float = 0.8) -> torch.
                         dtype=torch.float32)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    args         = parse_args()
+    prev_offsets = list(range(1, args.prev_frames + 1))
+    offsets_tag  = f'prev{args.prev_frames}'
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    print("\nLoading FastBEV4D...")
-    model = FastBEV4D(
-        in_channels=256,
-        bev_channels=64,
-        out_channels=256,
-        num_classes=10,
-        image_size=(256, 704),
-        feature_size=(16, 44),
-    )
+    ckpt_path   = args.checkpoint or Path(f'./checkpoints/fastbev4d_{offsets_tag}/best.pth')
+    output_dir  = args.output_dir or Path(f'./eval_output/eval_output_{offsets_tag}')
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not CHECKPOINT_PATH.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
+    print(f"Output dir  : {output_dir}")
 
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-    # Support both raw state_dict and training checkpoint format
-    state = ckpt.get('model', ckpt)
-    model.load_state_dict(state, strict=False)
-
-    model = model.to(device).eval()
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # ── nuScenes ──────────────────────────────────────────────────────────────
     print(f"\nLoading nuScenes {NUSCENES_VER}...")
     nusc       = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
     val_scenes = set(create_splits_scenes()[NUSCENES_SPLIT])
@@ -200,66 +203,96 @@ def main():
     ]
     print(f"  Val samples: {len(val_tokens)}")
 
-    scenes = build_scene_sequence(nusc, val_tokens)
+    submission_path = output_dir / 'submission.json'
 
-    # ── Inference with temporal context ───────────────────────────────────────
-    print("\nRunning inference...")
-    all_results = {}
-    total = sum(len(s) for s in scenes)
-    done  = 0
+    if args.reeval:
+        if not submission_path.exists():
+            raise FileNotFoundError(f"No submission.json in {output_dir}")
+        print(f"Skipping inference — reusing {submission_path}")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Device      : {device}")
+        print(f"Prev frames : {args.prev_frames}  (offsets {prev_offsets})")
+        print(f"Checkpoint  : {ckpt_path}")
 
-    for scene_tokens in scenes:
-        bev_feat_prev = None
-        ego_pose_prev = None
+        print("\nLoading FastBEV4D...")
+        model = FastBEV4D(
+            in_channels=256,
+            bev_channels=64,
+            out_channels=256,
+            num_classes=10,
+            image_size=(256, 704),
+            feature_size=(16, 44),
+            prev_frame_offsets=prev_offsets,
+        )
 
-        for token in scene_tokens:
-            done += 1
-            print(f"  [{done:3d}/{total}]", end='\r')
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-            # load_sample returns [N, 3, H, W] / [N, 4, 4] / [N, 3, 3] (N=1, monocam)
-            # unsqueeze(0) adds the batch dim → [B, N, ...]
-            img, intr, c2e, _, ego_pose, _ = load_sample(nusc, token)
-            img  = img.unsqueeze(0).to(device)   # [1, 1, 3, H, W]
-            intr = intr.unsqueeze(0).to(device)  # [1, 1, 3, 3]
-            c2e  = c2e.unsqueeze(0).to(device)   # [1, 1, 4, 4]
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        state = ckpt.get('model', ckpt)
+        model.load_state_dict(state, strict=False)
 
-            # SE(2) from previous frame (None on scene-first frame)
-            se2 = None
-            if ego_pose_prev is not None:
-                se2 = compute_se2(ego_pose_prev, ego_pose).to(device)
+        model = model.to(device).eval()
+        print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-            with torch.no_grad():
-                outputs = model(
-                    img, c2e, intr,
-                    bev_feat_prev=bev_feat_prev,
-                    se2=se2,
-                )
+        scenes = build_scene_sequence(nusc, val_tokens)
 
-            # Cache pre-fusion encoder output as prev for next frame (BEVDet4D convention)
-            bev_feat_prev = outputs['bev_feat_enc'].detach()
-            ego_pose_prev = ego_pose
+        print("\nRunning inference...")
+        all_results  = {}
+        total        = sum(len(s) for s in scenes)
+        done         = 0
+        max_offset   = max(prev_offsets)
 
-            # Decode and transform to global frame
-            dets = decode_to_nuscenes(outputs['predictions'], token)
-            dets = [ego_to_global(d, ego_pose) for d in dets]
-            all_results[token] = dets
+        for scene_tokens in scenes:
+            feat_cache = deque(maxlen=max_offset)
 
-    print(f"\n  Total detections: {sum(len(v) for v in all_results.values())}")
+            for token in scene_tokens:
+                done += 1
+                print(f"  [{done:3d}/{total}]", end='\r')
 
-    # ── Save submission ────────────────────────────────────────────────────────
-    submission = {
-        'meta': {
-            'use_camera': True, 'use_lidar': False,
-            'use_radar':  False, 'use_map':   False, 'use_external': False,
-        },
-        'results': all_results,
-    }
-    submission_path = EVAL_OUTPUT_DIR / 'submission.json'
-    with open(submission_path, 'w') as f:
-        json.dump(submission, f)
-    print(f"Saved submission → {submission_path}")
+                img, intr, c2e, _, ego_pose, _ = load_sample(nusc, token)
+                img  = img.unsqueeze(0).to(device)   # [1, 1, 3, H, W]
+                intr = intr.unsqueeze(0).to(device)  # [1, 1, 3, 3]
+                c2e  = c2e.unsqueeze(0).to(device)   # [1, 1, 4, 4]
 
-    # ── NuScenes eval ─────────────────────────────────────────────────────────
+                bev_feats_prev = None
+                se2_list       = None
+                if len(feat_cache) >= max_offset:
+                    bev_feats_prev = []
+                    se2s           = []
+                    for offset in prev_offsets:
+                        past_feat, past_ego = feat_cache[-offset]
+                        bev_feats_prev.append(past_feat)
+                        se2s.append(compute_se2(past_ego, ego_pose).to(device))  # [1, 3]
+                    se2_list = torch.stack(se2s, dim=1)  # [1, T, 3]
+
+                with torch.no_grad():
+                    outputs = model(
+                        img, c2e, intr,
+                        bev_feats_prev=bev_feats_prev,
+                        se2_list=se2_list,
+                    )
+
+                feat_cache.append((outputs['bev_feat_enc'].detach(), ego_pose))
+
+                dets = decode_to_nuscenes(outputs['predictions'], token)
+                dets = [ego_to_global(d, ego_pose) for d in dets]
+                all_results[token] = dets
+
+        print(f"\n  Total detections: {sum(len(v) for v in all_results.values())}")
+
+        submission = {
+            'meta': {
+                'use_camera': True, 'use_lidar': False,
+                'use_radar':  False, 'use_map':   False, 'use_external': False,
+            },
+            'results': all_results,
+        }
+        with open(submission_path, 'w') as f:
+            json.dump(submission, f)
+        print(f"Saved submission → {submission_path}")
+
     print("\nRunning nuScenes evaluation...")
     cfg      = config_factory('detection_cvpr_2019')
     evaluator = NuScenesEval(
@@ -267,7 +300,7 @@ def main():
         config=cfg,
         result_path=str(submission_path),
         eval_set=NUSCENES_SPLIT,
-        output_dir=str(EVAL_OUTPUT_DIR),
+        output_dir=str(output_dir),
         verbose=False,
     )
     metrics, _ = evaluator.evaluate()
@@ -283,14 +316,28 @@ def main():
         print(f"    {cls:<25s} {metrics.mean_dist_aps.get(cls, 0.0):.4f}")
     print("=" * 55)
 
+    tp = metrics.tp_errors  # keys: trans_err, scale_err, orient_err, vel_err, attr_err
     summary = {
-        'nds': metrics.nd_score,
-        'map': metrics.mean_ap,
+        'nds':  metrics.nd_score,
+        'map':  metrics.mean_ap,
+        'tp_errors': {
+            'mATE': tp.get('trans_err',   float('nan')),
+            'mASE': tp.get('scale_err',   float('nan')),
+            'mAOE': tp.get('orient_err',  float('nan')),
+            'mAVE': tp.get('vel_err',     float('nan')),
+            'mAAE': tp.get('attr_err',    float('nan')),
+        },
         'per_class_ap': {c: metrics.mean_dist_aps.get(c, 0.0) for c in CLASS_NAMES},
     }
-    with open(EVAL_OUTPUT_DIR / 'metrics_summary.json', 'w') as f:
+    with open(output_dir / 'metrics_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"Metrics saved → {EVAL_OUTPUT_DIR / 'metrics_summary.json'}")
+    print(f"\n  mATE : {summary['tp_errors']['mATE']:.4f}  (translation, m)")
+    print(f"  mASE : {summary['tp_errors']['mASE']:.4f}  (scale, 1-IoU)")
+    print(f"  mAOE : {summary['tp_errors']['mAOE']:.4f}  (orientation, rad)")
+    print(f"  mAVE : {summary['tp_errors']['mAVE']:.4f}  (velocity, m/s)")
+    print(f"  mAAE : {summary['tp_errors']['mAAE']:.4f}  (attribute)")
+    print("=" * 55)
+    print(f"Metrics saved → {output_dir / 'metrics_summary.json'}")
 
 
 if __name__ == '__main__':

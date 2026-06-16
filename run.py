@@ -9,8 +9,15 @@ Tensor conventions (monocam, N=1)
 imgs        : [B, 1, 3, H, W]
 cam2ego     : [B, 1, 4, 4]
 intrinsics  : [B, 1, 3, 3]
+
+Usage examples
+--------------
+    python run.py                   # default: t-1 only
+    python run.py --prev-frames 5   # fuse t-1, t-2, t-3, t-4, t-5
+    python run.py --prev-frames 10  # fuse t-1 through t-10
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -30,23 +37,43 @@ from data import NuScenesSequenceDataset, collate_fn
 NUSCENES_ROOT   = Path('./data/nuscenes')
 NUSCENES_VER    = 'v1.0-trainval'
 CHECKPOINT_PATH = Path('./models/fastbev-r50-cbgs/epoch_20_ema.pth')
-SAVE_DIR        = Path('./checkpoints/fastbev4d_fusion')
 
-NUM_EPOCHS  = 40
-LR_FUSION   = 1e-4
-LR_PRETRAINED = LR_FUSION * 0.01   # 1e-6, slow adaptation for pretrained components
-LR_HEAD       = LR_FUSION * 0.1    # 1e-5, medium for head
-GRAD_CLIP   = 5.0
-LOG_EVERY   = 10
-VAL_EVERY   = 1
-PATIENCE    = 5 # for validation
-RESUME_CKPT = SAVE_DIR / 'last.pth'  # set to None to train from scratch
+NUM_EPOCHS    = 40
+LR_FUSION     = 1e-4
+LR_PRETRAINED = LR_FUSION * 0.01
+LR_HEAD       = LR_FUSION * 0.1
+GRAD_CLIP     = 5.0
+LOG_EVERY     = 10
+VAL_EVERY     = 1
+PATIENCE      = 5
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='FastBEV4D training')
+    parser.add_argument(
+        '--prev-frames', type=int, default=1,
+        metavar='N',
+        help='Number of past frames to fuse: fuses t-1 through t-N. Default: 1.',
+    )
+    parser.add_argument(
+        '--save-dir', type=Path, default=None,
+        help='Checkpoint directory. Defaults to checkpoints/fastbev4d_prev<N>.',
+    )
+    return parser.parse_args()
 
 
 def main():
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+
+    offsets_tag = f'prev{args.prev_frames}'
+    save_dir    = args.save_dir or Path(f'./checkpoints/fastbev4d_{offsets_tag}')
+    resume_ckpt = save_dir / 'last.pth'
+
+    save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device : {device}")
+    print(f"Device      : {device}")
+    print(f"Prev frames : {args.prev_frames}")
+    print(f"Save dir    : {save_dir}")
 
     print("\nBuilding FastBEV4D...")
     model = FastBEV4D(
@@ -56,12 +83,14 @@ def main():
         num_classes=10,
         image_size=(256, 704),
         feature_size=(16, 44),
+        num_prev_frames=args.prev_frames,
     )
 
     if CHECKPOINT_PATH.exists():
         model = load_checkpoint(model, CHECKPOINT_PATH, device)
     else:
         print(f"  Warning: checkpoint not found at {CHECKPOINT_PATH}, training from scratch")
+
 
     model = model.to(device)
     scaler = GradScaler()
@@ -100,18 +129,18 @@ def main():
     patience_counter = 0
     history          = []
 
-    if RESUME_CKPT is not None and RESUME_CKPT.exists():
-        print(f"\nResuming from {RESUME_CKPT}")
-        resume = torch.load(RESUME_CKPT, map_location=device, weights_only=False)
+    if resume_ckpt is not None and resume_ckpt.exists():
+        print(f"\nResuming from {resume_ckpt}")
+        resume = torch.load(resume_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(resume['model'])
         optimizer.load_state_dict(resume['optimizer'])
         scheduler.load_state_dict(resume['scheduler'])
         start_epoch = resume['epoch'] + 1
-        best_path = SAVE_DIR / 'best.pth'
+        best_path = save_dir / 'best.pth'
         if best_path.exists():
             best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
             best_val_loss = best_ckpt.get('val_loss') or float('inf')
-        log_path = SAVE_DIR / 'log.json'
+        log_path = save_dir / 'log.json'
         if log_path.exists():
             with open(log_path) as f:
                 history = json.load(f)
@@ -119,8 +148,8 @@ def main():
 
     print("\nLoading nuScenes...")
     nusc      = NuScenes(version=NUSCENES_VER, dataroot=str(NUSCENES_ROOT), verbose=False)
-    train_set = NuScenesSequenceDataset(nusc, split='train')
-    val_set   = NuScenesSequenceDataset(nusc, split='val')
+    train_set = NuScenesSequenceDataset(nusc, split='train', prev_offsets=prev_offsets)
+    val_set   = NuScenesSequenceDataset(nusc, split='val',   prev_offsets=prev_offsets)
 
     loader = DataLoader(
         train_set, batch_size=16, shuffle=True,
@@ -136,6 +165,8 @@ def main():
 
     criterion = CenterPointLoss(num_classes=10)
 
+    T = len(prev_offsets)
+
     def run_epoch(loader, train=True):
         if train:
             model.train()
@@ -145,26 +176,30 @@ def main():
         total_loss = 0.0
         with torch.set_grad_enabled(train):
             for step, batch in enumerate(loader):
-                imgs_curr  = batch['img_curr'].to(device)       # [B, 1, 3, H, W]
-                c2e_curr   = batch['cam2ego_curr'].to(device)   # [B, 1, 4, 4]
-                intr_curr  = batch['intrinsics_curr'].to(device)# [B, 1, 3, 3]
-                imgs_prev  = batch['img_prev'].to(device)       # [B, 1, 3, H, W]
-                c2e_prev   = batch['cam2ego_prev'].to(device)   # [B, 1, 4, 4]
-                intr_prev  = batch['intrinsics_prev'].to(device)# [B, 1, 3, 3]
-                se2        = batch['se2'].to(device)            # [B, 3]
-                gt_boxes   = batch['gt_boxes']
+                imgs_curr   = batch['img_curr'].to(device)          # [B, 1, 3, H, W]
+                c2e_curr    = batch['cam2ego_curr'].to(device)      # [B, 1, 4, 4]
+                intr_curr   = batch['intrinsics_curr'].to(device)   # [B, 1, 3, 3]
+                imgs_prev   = batch['imgs_prev'].to(device)         # [B, T, 1, 3, H, W]
+                c2e_prev    = batch['cam2ego_prev'].to(device)      # [B, T, 1, 4, 4]
+                intr_prev   = batch['intrinsics_prev'].to(device)   # [B, T, 1, 3, 3]
+                se2_list    = batch['se2_list'].to(device)          # [B, T, 3]
+                gt_boxes    = batch['gt_boxes']
 
+                # Encode all T past frames (no grad — they're frozen context)
                 with torch.no_grad():
                     with autocast(device_type=device.type):
-                        bev_feat_prev, _ = model.encode(imgs_prev, c2e_prev, intr_prev)
+                        bev_feats_prev = [
+                            model.encode(imgs_prev[:, t], c2e_prev[:, t], intr_prev[:, t])[0]
+                            for t in range(T)
+                        ]
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast(device_type=device.type):
                     outputs = model(
                         imgs_curr, c2e_curr, intr_curr,
-                        bev_feat_prev=bev_feat_prev,
-                        se2=se2,
+                        bev_feats_prev=bev_feats_prev,
+                        se2_list=se2_list,
                     )
                     losses = criterion(outputs['predictions'], gt_boxes)
 
@@ -218,16 +253,16 @@ def main():
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
-                    torch.save(ckpt, SAVE_DIR / 'best.pth')
+                    torch.save(ckpt, save_dir / 'best.pth')
                     print(f"  -> new best (val_loss={best_val_loss:.4f}), saved best.pth")
                 else:
                     patience_counter += 1
                     if patience_counter >= PATIENCE:
-                        torch.save(ckpt, SAVE_DIR / 'last.pth')
+                        torch.save(ckpt, save_dir / 'last.pth')
                         print(f"Early stopping at epoch {epoch}")
                         break     
 
-        torch.save(ckpt, SAVE_DIR / 'last.pth')
+        torch.save(ckpt, save_dir / 'last.pth')
 
         history.append({
             'epoch':      epoch,
@@ -235,7 +270,7 @@ def main():
             'val_loss':   val_loss,
             'lr':         lr_fusion,
         })
-        with open(SAVE_DIR / 'log.json', 'w') as f:
+        with open(save_dir / 'log.json', 'w') as f:
             json.dump(history, f, indent=2)
         print()
 

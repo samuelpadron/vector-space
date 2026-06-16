@@ -69,6 +69,7 @@ class FastrayTransformer(nn.Module):
         feature_size: Tuple[int, int] = (16, 44),
         grid_config: Dict = None,
         stride: int = 16,
+        use_bevpool: bool = False,
     ):
         super().__init__()
         self.in_channels  = in_channels
@@ -76,6 +77,7 @@ class FastrayTransformer(nn.Module):
         self.image_size   = image_size
         self.feature_size = feature_size
         self.stride       = stride
+        self.use_bevpool  = use_bevpool
 
         if grid_config is None:
             grid_config = {
@@ -136,7 +138,10 @@ class FastrayTransformer(nn.Module):
         depth = x[..., :self.D].softmax(dim=-1)  # [B, N, H, W, D]
         feat  = x[..., self.D:]                   # [B, N, H, W, out_channels]
 
-        bev_feat = self._project_and_sample(feat, depth, cam2ego, cam_intrinsics)
+        if self.use_bevpool:
+            bev_feat = self._image_to_bev(feat, depth, cam2ego, cam_intrinsics)
+        else:
+            bev_feat = self._project_and_sample(feat, depth, cam2ego, cam_intrinsics)
         return bev_feat, depth
 
     def _project_and_sample(self, feat, depth, cam2ego, cam_intrinsics) -> torch.Tensor:
@@ -184,12 +189,25 @@ class FastrayTransformer(nn.Module):
                 if valid_idx.numel() == 0:
                     continue
 
-                u = feat_coords[valid_idx, 0].long().clamp(0, W - 1)
-                v = feat_coords[valid_idx, 1].long().clamp(0, H - 1)
-                d = depth_bin[valid_idx].clamp(0, self.D - 1)
+                fx = feat_coords[valid_idx, 0]
+                fy = feat_coords[valid_idx, 1]
+                d  = depth_bin[valid_idx].clamp(0, self.D - 1)
 
-                sampled_feat  = feat[b, n, v, u, :]       # [M, C]
-                sampled_depth = depth[b, n, v, u, d]      # [M]  — depth prob at voxel's bin
+                x0 = fx.floor().long().clamp(0, W - 2)
+                y0 = fy.floor().long().clamp(0, H - 2)
+                x1 = x0 + 1
+                y1 = y0 + 1
+                wx = (fx - x0.float()).clamp(0.0, 1.0).unsqueeze(-1)  # [M, 1]
+                wy = (fy - y0.float()).clamp(0.0, 1.0).unsqueeze(-1)  # [M, 1]
+
+                sampled_feat = (
+                    (1 - wy) * ((1 - wx) * feat[b, n, y0, x0, :] + wx * feat[b, n, y0, x1, :]) +
+                         wy  * ((1 - wx) * feat[b, n, y1, x0, :] + wx * feat[b, n, y1, x1, :])
+                )
+                sampled_depth = (
+                    (1 - wy[:, 0]) * ((1 - wx[:, 0]) * depth[b, n, y0, x0, d] + wx[:, 0] * depth[b, n, y0, x1, d]) +
+                         wy[:, 0]  * ((1 - wx[:, 0]) * depth[b, n, y1, x0, d] + wx[:, 0] * depth[b, n, y1, x1, d])
+                )
                 weighted_feat = sampled_feat * sampled_depth.unsqueeze(-1)
 
                 vx       = valid_idx // (self.Y * self.Z)
@@ -203,6 +221,108 @@ class FastrayTransformer(nn.Module):
                 )
 
         bev_feat = bev_feat.sum(dim=3)           # collapse Z → [B, X, Y, C]
+        bev_feat = bev_feat.permute(0, 3, 2, 1)  # [B, C, Y, X]
+        return bev_feat
+
+    def _image_to_bev(self, feat, depth, cam2ego, cam_intrinsics) -> torch.Tensor:
+        """
+        BEVPoolv2-equivalent accumulation: image→BEV direction.
+
+        Iterates over all (feature pixel, depth bin) pairs for each camera and
+        scatters feat[h,w] * depth_prob[h,w,d] into the corresponding BEV voxel.
+        This matches the original BEVPoolv2 CUDA kernel's accumulation pattern and
+        must be used when evaluating pretrained FastBEV++ checkpoints.
+        """
+        B, N, H, W, C = feat.shape
+        device = feat.device
+
+        # Feature-pixel centres in image space: pixel (w_f, h_f) → (u, v)
+        h_idx = torch.arange(H, device=device, dtype=torch.float32)
+        w_idx = torch.arange(W, device=device, dtype=torch.float32)
+        img_v, img_u = torch.meshgrid(
+            h_idx * self.stride + self.stride * 0.5,
+            w_idx * self.stride + self.stride * 0.5,
+            indexing='ij',
+        )  # [H, W]
+
+        # Depth bin lower bounds — matches torch.arange(*grid_config['depth'])
+        depth_vals = (
+            self.grid_config['depth'][0]
+            + torch.arange(self.D, device=device, dtype=torch.float32)
+            * self.grid_config['depth'][2]
+        )  # [D]
+
+        # Grid origin derived from the (checkpoint-loaded) voxel_coords buffer
+        x0 = self.voxel_coords[0, 0].item()
+        y0 = self.voxel_coords[0, 1].item()
+        z0 = self.voxel_coords[0, 2].item()
+        dx = self.grid_config['x'][2]
+        dy = self.grid_config['y'][2]
+        dz = self.grid_config['z'][2]
+
+        # Homogeneous image coords for all H*W feature pixels [H*W, 3]
+        ones_hw = torch.ones(H * W, device=device, dtype=torch.float32)
+        uv1 = torch.stack(
+            [img_u.reshape(-1), img_v.reshape(-1), ones_hw], dim=1
+        )  # [H*W, 3]
+
+        bev_feat = torch.zeros(B, self.X, self.Y, self.Z, C, device=device, dtype=feat.dtype)
+
+        for b in range(B):
+            for n in range(N):
+                K_inv = torch.linalg.inv(cam_intrinsics[b, n])  # [3, 3]
+                c2e   = cam2ego[b, n]                            # [4, 4]
+
+                # Normalised camera-space ray directions [H*W, 3]
+                # K_inv @ [u, v, 1]^T = [(u-cx)/fx, (v-cy)/fy, 1]
+                cam_dirs = (K_inv @ uv1.T).T  # [H*W, 3]
+
+                # 3D points for every (pixel, depth_bin) — [H*W, D, 3]
+                cam_pts = cam_dirs.unsqueeze(1) * depth_vals.view(1, -1, 1)
+
+                # Transform to ego frame — flatten first for batch matmul
+                HWD = H * W * self.D
+                cam_homo = torch.cat(
+                    [cam_pts.reshape(HWD, 3),
+                     torch.ones(HWD, 1, device=device, dtype=cam_pts.dtype)],
+                    dim=1,
+                )  # [HWD, 4]
+                ego_pts = (c2e @ cam_homo.T).T[:, :3]  # [HWD, 3]
+
+                # BEV voxel indices
+                vx = ((ego_pts[:, 0] - x0) / dx).long()
+                vy = ((ego_pts[:, 1] - y0) / dy).long()
+                vz = ((ego_pts[:, 2] - z0) / dz).long()
+
+                valid = (
+                    (vx >= 0) & (vx < self.X)
+                    & (vy >= 0) & (vy < self.Y)
+                    & (vz >= 0) & (vz < self.Z)
+                )
+                valid_idx = valid.nonzero(as_tuple=True)[0]
+                if valid_idx.numel() == 0:
+                    continue
+
+                # Map flat index → (h_f, w_f, d)
+                d_v  = valid_idx % self.D
+                hw_v = valid_idx // self.D
+                h_v  = hw_v // W
+                w_v  = hw_v % W
+
+                depth_w = depth[b, n, h_v, w_v, d_v]      # [M]
+                feats_v = feat[b, n, h_v, w_v, :]          # [M, C]
+                weighted = feats_v * depth_w.unsqueeze(-1)  # [M, C]
+
+                flat_bev = (
+                    vx[valid_idx] * self.Y * self.Z
+                    + vy[valid_idx] * self.Z
+                    + vz[valid_idx]
+                )
+                bev_feat[b].view(-1, C).scatter_add_(
+                    0, flat_bev.unsqueeze(-1).expand(-1, C), weighted.to(bev_feat.dtype)
+                )
+
+        bev_feat = bev_feat.sum(dim=3)            # [B, X, Y, C]
         bev_feat = bev_feat.permute(0, 3, 2, 1)  # [B, C, Y, X]
         return bev_feat
 
@@ -344,6 +464,7 @@ class FastBEV(nn.Module):
         num_classes=10,
         image_size=(256, 704),
         feature_size=(16, 44),
+        use_bevpool=False,
     ):
         super().__init__()
         self.bev_channels = bev_channels
@@ -357,6 +478,7 @@ class FastBEV(nn.Module):
             out_channels=bev_channels,
             image_size=image_size,
             feature_size=feature_size,
+            use_bevpool=use_bevpool,
         )
         self.img_bev_encoder_backbone = CustomResNetBEV(
             numC_input=bev_channels,
@@ -414,26 +536,42 @@ class FastBEV(nn.Module):
 
 
 class FastBEV4D(FastBEV):
-    def __init__(self, *args, **kwargs):
+    """
+    FastBEV with multi-frame temporal fusion.
+
+    prev_frame controls how many frames are fused
+    """
+
+    def __init__(self, *args, num_prev_frames=1, **kwargs):
         super().__init__(*args, **kwargs)
-        self.temporal_fusion = BEVTemporalFusionConcat(feat_channels=self.out_channels, dropout=0.3)
+        self.num_prev_frames = num_prev_frames
+        self.temporal_fusion = BEVTemporalFusionConcat(
+            feat_channels=self.out_channels,
+            num_prev_frames=self.num_prev_frames,
+            dropout=0.3,
+        )
 
     def forward(self, imgs, cam2ego, cam_intrinsics, img_aug_matrix=None,
-                bev_feat_prev=None, se2=None):
+                bev_feats_prev=None, se2_list=None):
+        """
+        Args:
+            imgs, cam2ego, cam_intrinsics: current frame tensors
+            bev_feats_prev: list of T tensors [B, C, H, W], one per offset in
+                            prev_frame_offsets. None to skip fusion.
+            se2_list: [B, T, 3] ego-motion from each past frame to current.
 
-        # 1. image -> view transformer (sparse BEV features)
+        Returns dict with keys: predictions, bev_feat, bev_feat_enc, depth.
+        """
         img_feats = self.extract_img_feat(imgs)
         bev_feat_sparse, depth = self.img_view_transformer(
             img_feats, cam2ego, cam_intrinsics, img_aug_matrix
         )
 
-        # 3. pretrained main BEV encoder + head
         bev_feats = self.img_bev_encoder_backbone(bev_feat_sparse)
         bev_feat_enc = self.img_bev_encoder_neck(bev_feats)
 
-        # 2. temporal fusion on bev neck features
-        if bev_feat_prev is not None and se2 is not None:
-            bev_feat_fused = self.temporal_fusion(bev_feat_enc, bev_feat_prev, se2)
+        if bev_feats_prev is not None and se2_list is not None:
+            bev_feat_fused = self.temporal_fusion(bev_feat_enc, bev_feats_prev, se2_list)
         else:
             bev_feat_fused = bev_feat_enc
 
@@ -442,7 +580,7 @@ class FastBEV4D(FastBEV):
         return {
             'predictions':  preds,
             'bev_feat':     bev_feat_fused,
-            'bev_feat_enc': bev_feat_enc,  # cache raw sparse features as prev
+            'bev_feat_enc': bev_feat_enc,
             'depth':        depth,
         }
 

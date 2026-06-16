@@ -186,7 +186,7 @@ def main():
             c2e  = c2e.unsqueeze(0).to(device)   # [1, 1, 4, 4]
 
             with torch.no_grad():
-                outputs = model(img, c2e, intr, bev_feat_prev=None, se2=None)
+                outputs = model(img, c2e, intr, bev_feats_prev=None, se2_list=None)
 
             dets = decode_to_nuscenes(outputs['predictions'], token)
             dets = [ego_to_global(d, ego_pose) for d in dets]
@@ -229,13 +229,27 @@ def main():
         print(f"    {cls:<25s} {metrics.mean_dist_aps.get(cls, 0.0):.4f}")
     print("=" * 55)
 
+    tp = metrics.tp_errors  # keys: trans_err, scale_err, orient_err, vel_err, attr_err
     summary = {
         'nds': metrics.nd_score,
         'map': metrics.mean_ap,
+        'tp_errors': {
+            'mATE': tp.get('trans_err',  float('nan')),
+            'mASE': tp.get('scale_err',  float('nan')),
+            'mAOE': tp.get('orient_err', float('nan')),
+            'mAVE': tp.get('vel_err',    float('nan')),
+            'mAAE': tp.get('attr_err',   float('nan')),
+        },
         'per_class_ap': {c: metrics.mean_dist_aps.get(c, 0.0) for c in CLASS_NAMES},
     }
     with open(EVAL_OUTPUT_DIR / 'metrics_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
+    print(f"\n  mATE : {summary['tp_errors']['mATE']:.4f}  (translation, m)")
+    print(f"  mASE : {summary['tp_errors']['mASE']:.4f}  (scale, 1-IoU)")
+    print(f"  mAOE : {summary['tp_errors']['mAOE']:.4f}  (orientation, rad)")
+    print(f"  mAVE : {summary['tp_errors']['mAVE']:.4f}  (velocity, m/s)")
+    print(f"  mAAE : {summary['tp_errors']['mAAE']:.4f}  (attribute)")
+    print("=" * 55)
     print(f"Metrics saved → {EVAL_OUTPUT_DIR / 'metrics_summary.json'}")
 
 

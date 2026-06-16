@@ -4,6 +4,7 @@ Pure PyTorch implementation - no mmcv/mmdet dependencies.
 Based on FastBEV++ paper: https://arxiv.org/abs/2512.08237
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -499,16 +500,15 @@ def visualize_comparison(
     out_baseline,
     out_baseline_prev,
     out_4d,
-    out_prev,
     save_path=None,
+    prev_frames=1,
 ):
     """
-    12-panel comparison figure (4 rows × 3 cols).
+    9-panel comparison figure (3 rows × 3 cols).
 
-    Row 0: [CAM_FRONT (t)]   [Baseline dets (t)]     [Baseline heatmap (t)]
-    Row 1: [CAM_FRONT (t)]   [4D dets (t, fused)]    [4D heatmap (t, fused)]
-    Row 2: [CAM_FRONT (t-1)] [Baseline dets (t-1)]   [Baseline heatmap (t-1)]
-    Row 3: [CAM_FRONT (t-1)] [4D dets (t-1, single)] [4D heatmap (t-1, single)]
+    Row 0: [CAM_FRONT (t)]   [Baseline dets (t)]   [Baseline heatmap (t)]
+    Row 1: [CAM_FRONT (t)]   [4D dets (t, fused)]  [4D heatmap (t, fused)]
+    Row 2: [CAM_FRONT (t-1)] [Baseline dets (t-1)] [Baseline heatmap (t-1)]
     """
     class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
@@ -520,7 +520,7 @@ def visualize_comparison(
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-    fig, axes = plt.subplots(4, 3, figsize=(18, 22))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 16))
 
     # --- helpers ---
     def add_rings(ax):
@@ -622,6 +622,8 @@ def visualize_comparison(
         n = draw_detections(ax, preds)
         setup_bev_ax(ax, f'{title} ({n})')
 
+    fused_label = f't-1..t-{prev_frames}' if prev_frames > 1 else 't-1'
+
     # --- ROW 0: Baseline at t ---
     show_camera(axes[0, 0],     image_curr, 'CAM_FRONT (t)')
     show_detections(axes[0, 1], out_baseline['predictions'], 'Baseline dets (t)')
@@ -629,20 +631,15 @@ def visualize_comparison(
 
     # --- ROW 1: FastBEV4D at t (with temporal fusion) ---
     show_camera(axes[1, 0],     image_curr, 'CAM_FRONT (t)')
-    show_detections(axes[1, 1], out_4d['predictions'], 'FastBEV4D dets (t, fused)')
-    show_heatmap(axes[1, 2],    out_4d['predictions'], 'FastBEV4D heatmap (t, fused)')
+    show_detections(axes[1, 1], out_4d['predictions'], f'FastBEV4D dets (t, fused {fused_label})')
+    show_heatmap(axes[1, 2],    out_4d['predictions'], f'FastBEV4D heatmap (t, fused {fused_label})')
 
     # --- ROW 2: Baseline at t-1 ---
     show_camera(axes[2, 0],     image_prev, 'CAM_FRONT (t-1)')
-    show_detections(axes[2, 1], out_baseline_prev['predictions'], 'Baseline dets (t-1)')
-    show_heatmap(axes[2, 2],    out_baseline_prev['predictions'], 'Baseline heatmap (t-1)')
+    show_detections(axes[2, 1], out_baseline_prev['predictions'], 'Dets (t-1)')
+    show_heatmap(axes[2, 2],    out_baseline_prev['predictions'], 'Heatmap (t-1)')
 
-    # --- ROW 3: FastBEV4D at t-1 (single-frame) ---
-    show_camera(axes[3, 0],     image_prev, 'CAM_FRONT (t-1)')
-    show_detections(axes[3, 1], out_prev['predictions'], 'FastBEV4D dets (t-1, single)')
-    show_heatmap(axes[3, 2],    out_prev['predictions'], 'FastBEV4D heatmap (t-1, single)')
-
-    plt.suptitle('FastBEV baseline vs FastBEV4D — t and t-1', fontsize=13)
+    plt.suptitle(f'FastBEV baseline vs FastBEV4D — t fusing {fused_label}', fontsize=13)
     plt.tight_layout()
 
     if save_path:
@@ -650,17 +647,51 @@ def visualize_comparison(
         print(f"  Saved comparison to {save_path}")
     plt.close()
     
+def parse_args():
+    parser = argparse.ArgumentParser(description='FastBEV4D inference / visualisation')
+    parser.add_argument(
+        '--prev-frames', type=int, default=1, metavar='N',
+        help='Number of past frames fused during training (must match checkpoint). Default: 1.',
+    )
+    parser.add_argument(
+        '--checkpoint', type=Path, default=None,
+        help='Path to FastBEV4D checkpoint. Defaults to checkpoints/fastbev4d_prev<N>/best.pth.',
+    )
+    parser.add_argument(
+        '--output-dir', type=Path, default=None,
+        help='Directory for output visualisations. Defaults to viz_output/fastbev4d_prev<N>.',
+    )
+    parser.add_argument(
+        '--num-samples', type=int, default=3, metavar='N',
+        help='Number of nuScenes samples to process. Default: 3.',
+    )
+    parser.add_argument(
+        '--nuscenes-root', type=Path, default=Path('./data/nuscenes'),
+        help='Path to nuScenes dataset root. Default: ./data/nuscenes.',
+    )
+    parser.add_argument(
+        '--nuscenes-version', type=str, default='v1.0-mini',
+        help='nuScenes version string. Default: v1.0-mini.',
+    )
+    return parser.parse_args()
+
+
 def main():
-    # Paths
-    nuscenes_root = Path('./data/nuscenes')
-    checkpoint_path = Path('./checkpoints/fastbev4d_fusion/best.pth')
-    output_dir = Path('./viz_output/fastbev4d')
+    args = parse_args()
+
+    offsets_tag     = f'prev{args.prev_frames}'
+    prev_offsets    = list(range(1, args.prev_frames + 1))
+    checkpoint_path = args.checkpoint or Path(f'./checkpoints/fastbev4d_{offsets_tag}/best.pth')
+    output_dir      = args.output_dir or Path(f'./viz_output/fastbev4d_{offsets_tag}')
+    nuscenes_root   = args.nuscenes_root
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
+    print(f"Using device  : {device}")
+    print(f"Prev frames   : {args.prev_frames}  (offsets {prev_offsets})")
+    print(f"Checkpoint    : {checkpoint_path}")
+    print(f"Output dir    : {output_dir}")
 
     # Create model
     print("\nCreating FastBEV4D model...")
@@ -671,6 +702,7 @@ def main():
         num_classes=10,
         image_size=(256, 704),
         feature_size=(16, 44),
+        prev_frame_offsets=prev_offsets,
     )
     
     model_baseline = FastBEV(
@@ -684,11 +716,10 @@ def main():
 
     # Load pretrained weights
     if checkpoint_path.exists():
-        model_4d = load_checkpoint(model_4d, checkpoint_path, device)
+        model_4d       = load_checkpoint(model_4d,       checkpoint_path, device)
         model_baseline = load_checkpoint(model_baseline, checkpoint_path, device)
     else:
-        print(f"Warning: Checkpoint not found at {checkpoint_path}")
-        print("Running with random weights...")
+        print(f"Warning: checkpoint not found at {checkpoint_path}, using random weights")
 
     model_4d = model_4d.to(device)
     model_baseline = model_baseline.to(device)
@@ -702,73 +733,88 @@ def main():
 
     # Load nuScenes
     print("\nLoading nuScenes...")
-    nusc = NuScenes(version='v1.0-mini', dataroot=str(nuscenes_root), verbose=False)
+    nusc = NuScenes(version=args.nuscenes_version, dataroot=str(nuscenes_root), verbose=False)
 
-    # Process multiple samples
-    for sample_idx in range(min(3, len(nusc.sample))):
-        sample = nusc.sample[sample_idx]
+    def has_enough_history(token, n):
+        for _ in range(n):
+            token = nusc.get('sample', token)['prev']
+            if not token:
+                return False
+        return True
+
+    # Process args.num_samples samples that each have >= args.prev_frames previous frames
+    found = 0
+    for sample in nusc.sample:
+        if found >= args.num_samples:
+            break
         sample_token = sample['token']
-        prev_token = nusc.get('sample', sample_token)['prev']
+        if not has_enough_history(sample_token, args.prev_frames):
+            continue
+        sample_idx = found
+        found += 1
         print(f"\nProcessing sample {sample_idx}: {sample_token[:8]}...")
 
-        # Load data
+        # Load current frame
         images, intrinsics, cam2egos, img_aug_matrices, sample_data = load_sample(nusc, sample_token)
-
-        # Compute depth map for visualization
-        cam_name = 'CAM_FRONT'
-        cam_token = sample_data['data'][cam_name]
-        cam_data = nusc.get('sample_data', cam_token)
-
-        # Add batch dimension and move to device
-        images = images.unsqueeze(0).to(device)
-        intrinsics = intrinsics.unsqueeze(0).to(device)
-        cam2egos = cam2egos.unsqueeze(0).to(device)
+        images          = images.unsqueeze(0).to(device)
+        intrinsics      = intrinsics.unsqueeze(0).to(device)
+        cam2egos        = cam2egos.unsqueeze(0).to(device)
         img_aug_matrices = img_aug_matrices.unsqueeze(0).to(device)
-
         print(f"  Input shape: {images.shape}")
 
-        # Run inference
+        ego_curr = nusc.get('ego_pose',
+            nusc.get('sample_data', sample_data['data']['CAM_FRONT'])['ego_pose_token'])
+
+        # Walk back args.prev_frames steps, collecting BEV features + SE2s
         print("  Running inference...")
         with torch.no_grad():
             outputs_baseline = model_baseline(images, cam2egos, intrinsics, img_aug_matrices)
-            
-            if prev_token:
-                # load prev frame
-                imgs_prev, intr_prev, c2e_prev, _, _ = load_sample(nusc, prev_token)
-                imgs_prev  = imgs_prev.unsqueeze(0).to(device)
-                intr_prev  = intr_prev.unsqueeze(0).to(device)
-                c2e_prev   = c2e_prev.unsqueeze(0).to(device)
 
-                bev_feat_prev, _ = model_4d.encode(imgs_prev, c2e_prev, intr_prev)
+            bev_feats_prev_list   = []
+            se2_tensors           = []
+            imgs_prev_first       = None
+            outputs_baseline_prev = None
 
-                # compute SE2 between prev and curr ego poses
-                ego_curr = nusc.get('ego_pose',
-                    nusc.get('sample_data', sample_data['data']['CAM_FRONT'])['ego_pose_token'])
-                ego_prev = nusc.get('ego_pose',
-                    nusc.get('sample_data',
-                        nusc.get('sample', prev_token)['data']['CAM_FRONT'])['ego_pose_token'])
-                se2 = _compute_se2(ego_prev, ego_curr).unsqueeze(0).to(device)
+            walk_token = sample_token
+            for t in range(args.prev_frames):
+                prev_t = nusc.get('sample', walk_token)['prev']
+                if not prev_t:
+                    break
 
-                # FastBEV4D with prev frame
-                outputs_4d = model_4d(
-                    images, cam2egos, intrinsics,
-                    bev_feat_prev=bev_feat_prev,
-                    se2=se2,
-                )
+                imgs_t, intr_t, c2e_t, _, sd_t = load_sample(nusc, prev_t)
+                imgs_t = imgs_t.unsqueeze(0).to(device)
+                intr_t = intr_t.unsqueeze(0).to(device)
+                c2e_t  = c2e_t.unsqueeze(0).to(device)
 
-                # Single-frame inference on prev frame for both models
-                outputs_baseline_prev = model_baseline(imgs_prev, c2e_prev, intr_prev)
-                outputs_prev          = model_4d(imgs_prev, c2e_prev, intr_prev)
+                bev_feat_t, _ = model_4d.encode(imgs_t, c2e_t, intr_t)
+                bev_feats_prev_list.append(bev_feat_t)
 
-        if prev_token:
+                ego_prev_t = nusc.get('ego_pose',
+                    nusc.get('sample_data', sd_t['data']['CAM_FRONT'])['ego_pose_token'])
+                se2_tensors.append(_compute_se2(ego_prev_t, ego_curr))
+
+                if t == 0:
+                    imgs_prev_first       = imgs_t
+                    outputs_baseline_prev = model_baseline(imgs_t, c2e_t, intr_t)
+
+                walk_token = prev_t
+
+            se2_list   = torch.stack(se2_tensors, dim=0).unsqueeze(0).to(device)  # [1, T, 3]
+            outputs_4d = model_4d(
+                images, cam2egos, intrinsics,
+                bev_feats_prev=bev_feats_prev_list,
+                se2_list=se2_list,
+            )
+
+        if imgs_prev_first is not None:
             visualize_comparison(
                 image_curr=images[0, 0],
-                image_prev=imgs_prev[0, 0],
+                image_prev=imgs_prev_first[0, 0],
                 out_baseline=outputs_baseline,
                 out_baseline_prev=outputs_baseline_prev,
                 out_4d=outputs_4d,
-                out_prev=outputs_prev,
                 save_path=output_dir / f'comparison_{sample_idx}.png',
+                prev_frames=args.prev_frames,
             )
     print(f"\nDone! Outputs saved to {output_dir}")
 

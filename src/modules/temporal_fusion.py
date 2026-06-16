@@ -79,26 +79,31 @@ class BEVWarp(nn.Module):
 
 class BEVTemporalFusionConcat(nn.Module):
     """
-    Simple Option A: Concatenate current and warped previous features,
+    Concatenate current and warped previous BEV features from N past frames,
     then squeeze with a 1x1 convolution.
+
+    Supports any number of past frames via num_prev_frames — e.g. 1 (BEVDet4D),
+    2 (t-5 + t-10), or more.
     """
 
-    def __init__(self, feat_channels: int = 256, dropout: float = 0.1):
+    def __init__(self, feat_channels: int = 256, num_prev_frames: int = 1, dropout: float = 0.1):
         """
         Args:
             feat_channels: Number of channels in BEV feature maps.
+            num_prev_frames: How many past frames to fuse. Controls fusion_conv input width.
         """
         super().__init__()
+        self.num_prev_frames = num_prev_frames
         self.warp = BEVWarp()
         self.dropout = nn.Dropout2d(p=dropout)
         self.fusion_conv = nn.Conv2d(
-            feat_channels * 2,
+            feat_channels * (1 + num_prev_frames),
             feat_channels,
             kernel_size=1,
             padding=0,
         )
         self._init_identity()
-        
+
     def _init_identity(self):
         with torch.no_grad():
             nn.init.zeros_(self.fusion_conv.weight)
@@ -111,32 +116,27 @@ class BEVTemporalFusionConcat(nn.Module):
     def forward(
         self,
         bev_feat_curr: torch.Tensor,
-        bev_feat_prev: torch.Tensor,
-        se2_transform: torch.Tensor,
+        bev_feats_prev: list,
+        se2_transforms: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Fuse current and previous BEV features.
+        Fuse current and multiple previous BEV features.
 
         Args:
-            bev_feat_curr: [B, C, H, W] Current frame BEV features
-            bev_feat_prev: [B, C, H, W] Previous frame BEV features
-            se2_transform: [B, 3] with [dx, dy, dyaw] ego-motion
+            bev_feat_curr:  [B, C, H, W] current frame
+            bev_feats_prev: list of T tensors [B, C, H, W], T == num_prev_frames
+            se2_transforms: [B, T, 3] ego-motion per past frame (dx_grid, dy_grid, dyaw)
 
         Returns:
-            fused: [B, C, H, W] Temporally fused features
+            fused: [B, C, H, W]
         """
-        # Warp previous features to current frame
-        warped_prev = self.warp(bev_feat_prev, se2_transform)
-
-        # Concatenate along channel dimension
-        concatenated = torch.cat([bev_feat_curr, warped_prev], dim=1)  # [B, 2C, H, W]
-        
+        warped = [
+            self.warp(bev_feats_prev[t], se2_transforms[:, t])
+            for t in range(len(bev_feats_prev))
+        ]
+        concatenated = torch.cat([bev_feat_curr] + warped, dim=1)
         concatenated = self.dropout(concatenated)
-
-        # Squeeze back to original channel count
-        fused = self.fusion_conv(concatenated)  # [B, C, H, W]
-
-        return fused
+        return self.fusion_conv(concatenated)
 
 
 class ConvGRUCell(nn.Module):
